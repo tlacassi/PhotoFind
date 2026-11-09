@@ -1,6 +1,7 @@
 services:
   photofind:
     build: .
+    pull_policy: build
     restart: unless-stopped
     ports:
       - "127.0.0.1:18080:8000"
