@@ -5,6 +5,8 @@ import sqlite3
 import threading
 import uuid
 import secrets
+import hashlib
+import time
 
 import auth
 from pathlib import Path
@@ -41,6 +43,9 @@ def connect():
 
 with connect() as db:
     db.execute('CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, name TEXT NOT NULL, faces TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS client_links (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS client_sessions (token_hash TEXT PRIMARY KEY, link_hash TEXT NOT NULL, expires INTEGER NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS client_matches (session_hash TEXT NOT NULL, photo_id TEXT NOT NULL, PRIMARY KEY(session_hash, photo_id))')
 
 
 def read_image(contents):
@@ -142,14 +147,65 @@ def create_photographer(credentials: Credentials, user=Depends(auth.admin_user))
 
 
 
-@app.get('/client', name='client_page')
-def client_page(user=Depends(auth.current_user)):
-    return FileResponse(ROOT / 'static' / 'client.html')
+def digest(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
 
-@app.get('/api/client-qr')
-def client_qr(request: Request, user=Depends(auth.current_user)):
-    image = qrcode.make(str(request.url_for('client_page')))
+def client_session(request: Request):
+    token = request.cookies.get('photofind_client', '')
+    if len(token) > 128:
+        raise HTTPException(401, 'Lien client invalide ou expiré.')
+    session_hash = digest(token)
+    with connect() as db:
+        row = db.execute('SELECT s.token_hash FROM client_sessions s JOIN client_links l ON l.token_hash=s.link_hash WHERE s.token_hash=? AND s.expires>? AND l.expires>?', (session_hash, int(time.time()), int(time.time()))).fetchone()
+    if row is None:
+        raise HTTPException(401, 'Lien client invalide ou expiré.')
+    return session_hash
+
+
+class ClientToken(BaseModel):
+    token: str = Field(max_length=128)
+
+
+@app.get('/client')
+def client_page():
+    return FileResponse(ROOT / 'static' / 'client.html', headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+
+@app.post('/api/client-links')
+def create_client_link(user=Depends(auth.current_user)):
+    token = secrets.token_urlsafe(32)
+    with connect() as db:
+        db.execute('INSERT INTO client_links VALUES (?, ?)', (digest(token), int(time.time()) + 7 * 86400))
+    return {'token': token, 'expires_in_days': 7}
+
+
+@app.post('/api/client/redeem')
+def redeem_client_link(payload: ClientToken, request: Request, response: Response):
+    link_hash = digest(payload.token)
+    now = int(time.time())
+    with connect() as db:
+        row = db.execute('SELECT expires FROM client_links WHERE token_hash=? AND expires>?', (link_hash, now)).fetchone()
+        if row is None:
+            raise HTTPException(401, 'Lien client invalide ou expiré.')
+        session = secrets.token_urlsafe(32)
+        db.execute('INSERT INTO client_sessions VALUES (?, ?, ?)', (digest(session), link_hash, min(row['expires'], now + 8 * 3600)))
+    response.set_cookie('photofind_client', session, httponly=True, secure=request.url.scheme == 'https', samesite='strict', max_age=8 * 3600, path='/')
+    response.headers['Cache-Control'] = 'no-store'
+    return {'ok': True}
+
+
+@app.post('/api/client-qr')
+def client_qr(payload: ClientToken, request: Request, user=Depends(auth.current_user)):
+    with connect() as db:
+        if db.execute('SELECT 1 FROM client_links WHERE token_hash=? AND expires>?', (digest(payload.token), int(time.time()))).fetchone() is None:
+            raise HTTPException(404, 'Lien invalide.')
+    origin = request.headers.get('origin', '')
+    from urllib.parse import urlsplit
+    parsed = urlsplit(origin)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
+        raise HTTPException(400, 'Origine invalide.')
+    image = qrcode.make(origin + '/client#' + payload.token)
     buffer = io.BytesIO()
     image.save(buffer, format='PNG')
     return Response(buffer.getvalue(), media_type='image/png', headers={'Cache-Control': 'no-store'})
@@ -187,7 +243,7 @@ async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_
 
 
 @app.post('/api/search')
-async def search(file: UploadFile = File(...), user=Depends(auth.current_user)):
+async def search(file: UploadFile = File(...), session_hash=Depends(client_session)):
     try:
         faces = embeddings(await image_bytes(file))
     except ValueError as e:
@@ -206,6 +262,9 @@ async def search(file: UploadFile = File(...), user=Depends(auth.current_user)):
             score = max(float(np.dot(query, vector)) for vector in vectors)
             if score >= THRESHOLD:
                 matches.append({'id': row['id'], 'name': row['name'], 'score': round(score, 3)})
+    with connect() as db:
+        db.execute('DELETE FROM client_matches WHERE session_hash=?', (session_hash,))
+        db.executemany('INSERT INTO client_matches VALUES (?, ?)', [(session_hash, item['id']) for item in matches])
     return sorted(matches, key=lambda x: x['score'], reverse=True)
 
 
@@ -217,6 +276,31 @@ def photo_image(photo_id: str, user=Depends(auth.current_user)):
     if not path.is_file():
         raise HTTPException(404)
     return FileResponse(path, media_type='image/jpeg', filename='photo.jpg', content_disposition_type='inline')
+
+
+@app.get('/api/client/photos/{photo_id}/image')
+def client_photo_image(photo_id: str, session_hash=Depends(client_session)):
+    with connect() as db:
+        allowed = db.execute('SELECT 1 FROM client_matches WHERE session_hash=? AND photo_id=?', (session_hash, photo_id)).fetchone()
+    if allowed is None or len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
+        raise HTTPException(404)
+    path = PHOTOS / (photo_id + '.jpg')
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type='image/jpeg', filename='photo.jpg', content_disposition_type='inline', headers={'Cache-Control': 'no-store'})
+
+
+@app.delete('/api/photos/{photo_id}')
+def delete_photo(photo_id: str, user=Depends(auth.current_user)):
+    if len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
+        raise HTTPException(404, 'Photo introuvable.')
+    with lock, connect() as db:
+        row = db.execute('SELECT id FROM photos WHERE id = ?', (photo_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Photo introuvable.')
+        (PHOTOS / (photo_id + '.jpg')).unlink(missing_ok=True)
+        db.execute('DELETE FROM photos WHERE id = ?', (photo_id,))
+    return {'deleted': True}
 
 
 @app.delete('/api/photos')
