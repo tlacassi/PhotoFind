@@ -278,6 +278,103 @@ class GalleryTests(unittest.TestCase):
         self.assertLessEqual(self.alice.get('/api/me').json()['used_bytes'],used + used//4)
 
 
+    def test_named_links_can_be_copied_and_deleted_from_list(self):
+        created = self.alice.post('/api/client-links',json={'gallery_id':self.a,'name':'Client Dupont','mode':'both'}).json()
+        response = self.alice.get('/api/client-links',params={'gallery_id':self.a})
+        self.assertEqual(response.headers['cache-control'],'no-store')
+        link = response.json()[0]
+        self.assertEqual(link['name'],'Client Dupont')
+        self.assertEqual(link['token'],created['token'])
+        client = TestClient(app.app)
+        self.assertEqual(client.post('/api/client/redeem',json={'token':link['token']}).status_code,200)
+        self.alice.delete('/api/client-links/'+link['id'])
+        self.assertEqual(self.alice.get('/api/client-links',params={'gallery_id':self.a}).json(),[])
+        self.assertEqual(client.get('/api/client/session').status_code,401)
+        self.assertEqual(client.post('/api/client/redeem',json={'token':link['token']}).status_code,401)
+
+    def test_gallery_page_and_branding_are_owner_scoped(self):
+        self.assertEqual(self.alice.get('/galeries/'+self.a+'/alice').status_code,200)
+        self.assertEqual(self.bob.get('/galeries/'+self.a+'/alice').status_code,404)
+        self.assertEqual(self.alice.patch('/api/galleries/'+self.a,json={'accent_color':'#123456','background_color':'#f1f2f3'}).status_code,200)
+        self.assertEqual(self.bob.patch('/api/galleries/'+self.a,json={'accent_color':'#123456'}).status_code,404)
+        self.assertEqual(self.alice.patch('/api/galleries/'+self.a,json={'accent_color':'url(bad)'}).status_code,422)
+        self.assertEqual(self.alice.post('/api/galleries/'+self.a+'/logo',files={'file':('logo.png',self.image)}).status_code,200)
+        self.assertEqual(self.bob.get('/api/galleries/'+self.a+'/logo').status_code,404)
+        link = self.alice.post('/api/client-links',json={'gallery_id':self.a}).json()
+        client = TestClient(app.app)
+        session = client.post('/api/client/redeem',json={'token':link['token']}).json()
+        self.assertEqual(session['accent_color'],'#123456')
+        self.assertTrue(session['logo'])
+        self.assertEqual(client.get('/api/client/logo',params={'gallery_id':self.a}).status_code,200)
+        self.assertEqual(client.get('/api/client/logo',params={'gallery_id':self.b}).status_code,401)
+        self.alice.delete('/api/galleries/'+self.a+'/logo')
+        self.assertEqual(client.get('/api/client/logo',params={'gallery_id':self.a}).status_code,404)
+
+    def test_persistent_processing_recovery_and_thumbnails(self):
+        import time
+        import jobs
+        response = self.alice.post('/api/photo-jobs',params={'gallery_id':self.a},files={'files':('queued.png',self.image)})
+        self.assertEqual(response.status_code,202)
+        job_id = response.json()['id']
+        with app.connect() as db:
+            job = dict(db.execute('SELECT * FROM photo_jobs WHERE id=?',(job_id,)).fetchone())
+            user = db.execute("SELECT * FROM users WHERE username='alice'").fetchone()
+        self.assertGreater(self.alice.get('/api/me').json()['pending_bytes'],0)
+        # Simulate a crash after the original was committed, before the job was marked done.
+        with app.connect() as db: db.execute("UPDATE photo_jobs SET status='processing' WHERE id=?",(job_id,))
+        first = app.finish_photo_job(job)
+        photo = first['photo_id']
+        self.assertEqual(self.alice.get(f'/api/photos/{photo}/thumbnail').headers['x-thumbnail-ready'],'0')
+        self.assertEqual(self.bob.get(f'/api/photos/{photo}/thumbnail').status_code,404)
+        with app.connect() as db: db.execute("UPDATE photo_jobs SET status='processing' WHERE id=?",(job_id,))
+        runner = jobs.ProcessingQueue(app.DB,app.finish_photo_job,app.cleanup_photo_job,app.generate_next_thumbnail,2)
+        runner.start()
+        try:
+            for _ in range(100):
+                response = self.alice.get('/api/photo-jobs',params={'gallery_id':self.a}).json()
+                thumb = self.alice.head(f'/api/photos/{photo}/thumbnail')
+                if response['remaining']==0 and thumb.headers['x-thumbnail-ready']=='1': break
+                time.sleep(.03)
+            else: self.fail('Persistent processing or thumbnails did not finish')
+        finally: runner.stop()
+        with app.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM photos WHERE gallery_id=?',(self.a,)).fetchone()[0],1)
+        self.assertFalse(app.incoming_path(job).exists())
+        self.assertEqual(self.alice.get('/api/me').json()['pending_bytes'],0)
+        small = self.alice.get(f'/api/photos/{photo}/thumbnail')
+        with Image.open(io.BytesIO(small.content)) as image: self.assertLessEqual(max(image.size),480)
+        client, _ = self.client_for(self.alice,self.a)
+        self.assertEqual(client.get(f'/api/client/photos/{photo}/thumbnail').status_code,404)
+        client.post('/api/search',files={'file':('selfie.png',self.image)})
+        self.assertEqual(client.get(f'/api/client/photos/{photo}/thumbnail').status_code,200)
+        self.assertEqual(self.bob.get('/api/photo-jobs',params={'gallery_id':self.a}).status_code,404)
+        self.alice.delete(f'/api/photos/{photo}')
+        self.assertEqual(self.alice.get(f'/api/photos/{photo}/thumbnail').status_code,404)
+
+    def test_clear_photos_cancels_incoming_processing(self):
+        response = self.alice.post('/api/photo-jobs',params={'gallery_id':self.a},files={'files':('queued.png',self.image)})
+        job_id = response.json()['id']
+        with app.connect() as db:
+            job = dict(db.execute('SELECT * FROM photo_jobs WHERE id=?',(job_id,)).fetchone())
+            user = db.execute("SELECT * FROM users WHERE username='alice'").fetchone()
+        contents = app.incoming_path(job).read_bytes()
+        self.assertEqual(self.alice.delete('/api/photos',params={'gallery_id':self.a}).status_code,200)
+        self.assertFalse(app.incoming_path(job).exists())
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException): app.process_photo(contents,'queued.png',self.a,user,job_id)
+        self.assertEqual(self.alice.get('/api/photos',params={'gallery_id':self.a}).json(),[])
+
+    def test_delete_gallery_cancels_queued_files(self):
+        response = self.alice.post('/api/photo-jobs',params={'gallery_id':self.a},files={'files':('queued.png',self.image)})
+        self.assertEqual(response.status_code,202)
+        with app.connect() as db:
+            job = dict(db.execute('SELECT * FROM photo_jobs WHERE id=?',(response.json()['id'],)).fetchone())
+        self.assertTrue(app.incoming_path(job).exists())
+        self.assertEqual(self.alice.delete('/api/galleries/'+self.a).status_code,200)
+        self.assertFalse(app.incoming_path(job).exists())
+        with app.connect() as db: self.assertFalse(db.execute('SELECT 1 FROM photo_jobs WHERE id=?',(job['id'],)).fetchone())
+
+
 class MigrationTests(unittest.TestCase):
     def test_existing_photo_files_migrate_into_user_and_gallery_folders(self):
         with tempfile.TemporaryDirectory() as directory:

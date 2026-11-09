@@ -52,6 +52,9 @@ def backup(source, destination):
         with sqlite3.connect(f'file:{source / "photos.db"}?mode=ro', uri=True) as src, sqlite3.connect(destination / 'photos.db') as dst:
             src.backup(dst)
         shutil.copytree(source / 'photos', destination / 'photos')
+        key = source / 'link-signing.key'
+        if key.exists():
+            shutil.copy2(key, destination / key.name)
         validate(destination)
         manifest = {str(file.relative_to(destination)): checksum(file) for file in destination.rglob('*') if file.is_file()}
         (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2))

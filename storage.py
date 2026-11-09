@@ -24,6 +24,9 @@ def initialize(path: Path):
             db.execute('ALTER TABLE galleries ADD COLUMN storage_name TEXT')
         db.execute('DROP INDEX IF EXISTS galleries_storage_name')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS galleries_owner_storage ON galleries(owner_id, storage_name)')
+        for name, definition in [('accent_color', "TEXT NOT NULL DEFAULT '#789a78'"), ('background_color', "TEXT NOT NULL DEFAULT '#f8f7f1'"), ('logo', 'INTEGER NOT NULL DEFAULT 0'), ('branding_bytes', 'INTEGER NOT NULL DEFAULT 0')]:
+            if name not in {row['name'] for row in db.execute('PRAGMA table_info(galleries)')}:
+                db.execute(f'ALTER TABLE galleries ADD COLUMN {name} {definition}')
         db.execute('CREATE TABLE IF NOT EXISTS gallery_members (gallery_id TEXT REFERENCES galleries(id), user_id INTEGER REFERENCES users(id), PRIMARY KEY(gallery_id,user_id))')
         for table in ('photos', 'client_links'):
             columns = {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}
@@ -36,8 +39,17 @@ def initialize(path: Path):
             db.execute("UPDATE client_links SET gallery_id='legacy' WHERE gallery_id IS NULL")
         if 'bytes' not in {row['name'] for row in db.execute('PRAGMA table_info(photos)')}:
             db.execute('ALTER TABLE photos ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0')
+        for name, definition in [('job_id','TEXT'),('thumbnail_bytes','INTEGER NOT NULL DEFAULT 0'),('thumbnail_status','INTEGER NOT NULL DEFAULT 0')]:
+            if name not in {row['name'] for row in db.execute('PRAGMA table_info(photos)')}:
+                db.execute(f'ALTER TABLE photos ADD COLUMN {name} {definition}')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS photos_job ON photos(job_id)')
+        db.execute("CREATE TABLE IF NOT EXISTS photo_jobs (id TEXT PRIMARY KEY, gallery_id TEXT NOT NULL REFERENCES galleries(id), user_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, input_path TEXT NOT NULL, input_bytes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued', error TEXT, faces INTEGER, photo_id TEXT, created INTEGER NOT NULL)")
+        db.execute('CREATE INDEX IF NOT EXISTS photo_jobs_gallery ON photo_jobs(gallery_id,status)')
         if 'mode' not in {row['name'] for row in db.execute('PRAGMA table_info(client_links)')}:
             db.execute("ALTER TABLE client_links ADD COLUMN mode TEXT NOT NULL DEFAULT 'search'")
+        for name, definition in [('name', "TEXT NOT NULL DEFAULT 'Lien client'"), ('nonce', 'TEXT')]:
+            if name not in {row['name'] for row in db.execute('PRAGMA table_info(client_links)')}:
+                db.execute(f'ALTER TABLE client_links ADD COLUMN {name} {definition}')
         db.execute('CREATE INDEX IF NOT EXISTS photos_gallery ON photos(gallery_id)')
         db.execute('CREATE INDEX IF NOT EXISTS links_gallery ON client_links(gallery_id)')
 

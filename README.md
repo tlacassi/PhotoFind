@@ -12,12 +12,25 @@ pas envoyées à un service de reconnaissance externe.
   dernière photo importée par défaut ; le bouton étoile permet de la choisir. Une galerie appartient à un
   compte ; son propriétaire peut autoriser explicitement d'autres photographes.
   L'administrateur voit toutes les galeries.
-- **Import** : trois requêtes simultanées permettent de poursuivre les envois pendant
-  les analyses. Deux analyses au maximum par processus (`ANALYSIS_WORKERS`, défaut 2),
-  avec un thread OpenCV par traitement (`OPENCV_THREADS`, défaut 1). Décodage, analyse
-  et écriture sont exécutés hors de la boucle des requêtes. Progression globale
-  du transfert et détail par photo ; l’arrêt termine les photos déjà en cours,
-  puis la reprise renvoie les éléments restants.
+- **Import** : sélection ou glisser-déposer dans une galerie, voile de dépôt et panneau
+  de progression en bas à droite. Trois envois simultanés transmettent les fichiers
+  vers une file persistante sur le serveur. Après leur envoi, l’analyse et l’écriture
+  continuent même si l’onglet est fermé. Les requêtes et fichiers qui n’ont pas fini
+  d’être envoyés nécessitent de garder l’onglet ouvert. Deux analyses au maximum
+  (`ANALYSIS_WORKERS`, défaut 2), un thread OpenCV par analyse (`OPENCV_THREADS`, défaut 1).
+  La file SQLite reprend les traitements interrompus au redémarrage ; un identifiant
+  de traitement évite de dupliquer une photo déjà enregistrée lors de cette reprise.
+  Les galeries indiquent le nombre de photos restantes.
+- **Miniatures et visionneuse** : un worker génère les aperçus de 480 pixels maximum
+  dans `.thumbnails/` au sein de la galerie. En attendant, la grille utilise le JPEG
+  principal ; elle passe ensuite à l’aperçu. La visionneuse client et photographe
+  affiche le JPEG principal, avec précédent/suivant et navigation clavier. Le nom de
+  fichier n’est pas affiché côté client. Les résultats du selfie sont placés en haut
+  et annoncent directement leur nombre.
+- **Navigation et personnalisation** : l’accueil photographe liste les galeries ;
+  chacune s’ouvre sur `/galeries/<id>/<nom>`. Le nom de l’URL peut changer sans casser
+  l’identifiant. Une galerie peut définir sa couleur principale, son fond et son logo
+  PNG/JPEG/WebP (2 Mo maximum, réencodé en PNG). Par défaut, PhotoFind est conservé.
 - **Clients sans compte** : lien privé et QR code associés à une galerie, validité
   de 1 à 90 jours, plusieurs liens simultanés avec des expirations indépendantes.
   Modes : galerie seule, selfie seul ou les deux. Le serveur contrôle les modes.
@@ -25,7 +38,11 @@ pas envoyées à un service de reconnaissance externe.
   contre un cookie HttpOnly. Une session dure au maximum 8 heures. En mode selfie seul, les images
   téléchargeables sont limitées aux résultats de la recherche de cette session.
   En mode galerie ou mixte, toutes les images de cette galerie sont consultables.
-- **Liens** : liste des dates d'expiration et révocation immédiate des accès liés.
+- **Liens** : nom du client, date d’expiration, boutons Copier, QR code et Supprimer.
+  Supprimer retire définitivement le lien de la liste et invalide ses sessions.
+  Les nouveaux liens peuvent être reconstruits grâce à `link-signing.key`, conservée
+  avec les données et incluse dans la sauvegarde. Les anciens liens stockés uniquement
+  sous forme d’empreinte restent valables, mais doivent être recréés pour être recopiés.
   La désactivation révoque les liens ; réactiver la galerie ne les réactive pas.
   La suppression efface sa galerie, ses photos et ses liens après confirmation,
   y compris lorsque la galerie est désactivée.
@@ -40,7 +57,9 @@ pas envoyées à un service de reconnaissance externe.
   automatique aux galeries existantes. Les invitations sont listables et révocables.
 - **Quotas** : quota des photos modifiable par l’administrateur, consommation visible
   des deux côtés. Valeur vide = illimité dans la gestion des comptes, 0 = aucun
-  nouvel import. L’usage correspond aux JPEG stockés, pas aux octets transférés.
+  nouvel import. L’usage correspond aux JPEG, miniatures et logos stockés. Les fichiers en attente
+  réservent aussi leurs octets jusqu’à la fin du traitement. Si le quota ne laisse
+  pas de place pour une miniature, le JPEG principal reste affiché.
   Les imports concurrents réservent leur place dans une transaction SQLite pour
   éviter de dépasser le quota. Un import dans une galerie partagée compte pour
   son propriétaire. Les comptes existants restent illimités jusqu’à modification ;
@@ -90,6 +109,9 @@ accessible en lecture/écriture à l'UID 10001 du conteneur. La base `photos.db`
 photos réencodées et les empreintes y résident, hors du dépôt et de l'image.
 La bibliothèque locale du Mac est distincte de celle du serveur.
 
+Un seul processus PhotoFind doit utiliser un dossier de données donné ; un verrou
+exclusif évite de démarrer deux instances qui récupéreraient la même file de travail.
+
 Les fichiers sont rangés dans `photos/user-<id>-<identifiant>/<date>-<nom-galerie>/`.
 La date utilise UTC. Un nom déjà pris reçoit `-1`, `-2`, etc., sans réutiliser de
 dossier existant, y compris hors base. Les identifiants de galerie et les liens
@@ -132,7 +154,7 @@ python maintenance.py restore /mnt/data/PhotoFind-backups/snapshot-001 /mnt/data
 ```
 
 Les destinations doivent être de nouveaux dossiers. Le script conserve la base,
-les images et un manifeste SHA-256, contrôle l'intégrité SQLite et vérifie les
+les images, miniatures, logos, fichiers en attente, la clé de liens et un manifeste SHA-256, contrôle l'intégrité SQLite et vérifie les
 images référencées. La restauration refuse une sauvegarde altérée et n'écrase pas
 les données existantes. Pour utiliser la copie restaurée, changez le bind mount,
 vérifiez les permissions de l'UID 10001, puis redémarrez la stack. Gardez l'ancien
@@ -162,8 +184,9 @@ et un DOM simulé : une validation visuelle dans un navigateur reste nécessaire
 
 - JPEG/PNG/WebP, 20 Mo par fichier. Les images téléchargées sont réencodées en JPEG,
   limitées à 2400 pixels sur le plus grand côté ; les originaux ne sont pas conservés.
-- La reprise concerne les fichiers du lot dans l'onglet ouvert. Pas de reprise par
-  morceaux après fermeture du navigateur. Une réponse réseau perdue après import
+- La reprise des fichiers pas encore transférés concerne le lot dans l’onglet ouvert.
+  Pas de reprise par morceaux après fermeture du navigateur. Les fichiers déjà reçus
+  par le serveur restent dans la file persistante et sont traités sans le navigateur. Une réponse réseau perdue après import
   peut entraîner un doublon si le fichier est renvoyé. Le transfert et l'analyse
   sont des phases séparées ; 100 % du transfert ne signifie pas analyse terminée.
 - La reconnaissance peut manquer une personne ou proposer une mauvaise photo.

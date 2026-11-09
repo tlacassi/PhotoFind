@@ -1,5 +1,7 @@
 const $ = selector => document.querySelector(selector);
 const photoInput = $('#photos'), selfieInput = $('#selfie');
+const processingFiles = new Map(), pendingThumbnails = new Set();
+let backgroundPolling = false, toastDismissed = false;
 let clientGalleryId = null;
 let me, selectedGallery, galleryList = [], failedUploads = [], stopUpload = false, uploading = false;
 async function api(url, options) {
@@ -10,18 +12,25 @@ async function api(url, options) {
 const jsonRequest = (method, body) => ({method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
 const allowed = permission => me?.role === 'admin' || Boolean(me?.[permission]);
 const galleryURL = path => `${path}?gallery_id=${encodeURIComponent(selectedGallery.id)}`;
+function photographerGalleryPath(gallery) {
+  const slug = gallery.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'galerie';
+  return `/galeries/${gallery.id}/${slug}`;
+}
 function message(error) { $('#gallery-status').textContent = error.message; }
 function action(text, handler) {
   const button = document.createElement('button'); button.type = 'button'; button.className = 'text-button'; button.textContent = text;
   button.addEventListener('click', () => Promise.resolve().then(handler).catch(message)); return button;
 }
-function card(photo, download = false) {
+function card(photo, download = false, collection = [photo]) {
   const wrap = document.createElement('div'); wrap.className = download ? 'result' : 'thumb';
-  const image = document.createElement('img'); image.src = download ? `/api/client/photos/${photo.id}/image?gallery_id=${encodeURIComponent(clientGalleryId)}` : `/api/photos/${photo.id}/image`; image.alt = photo.name; image.loading = 'lazy'; wrap.append(image);
+  const image = document.createElement('img'); image.src = download ? `/api/client/photos/${photo.id}/thumbnail?gallery_id=${encodeURIComponent(clientGalleryId)}` : `/api/photos/${photo.id}/thumbnail`;
+  pendingThumbnails.add(image); image.alt = download ? 'Photo de la galerie' : photo.name; image.loading = 'lazy';
+  const open = document.createElement('button'); open.type = 'button'; open.className = 'photo-open'; open.setAttribute('aria-label', 'Ouvrir la photo en grand'); open.append(image);
+  open.addEventListener('click', () => openPhotoViewer(collection, collection.findIndex(item => item.id === photo.id), {client:download, galleryId:clientGalleryId})); wrap.append(open);
   if (download) {
-    const details = document.createElement('div'), name = document.createElement('span'), link = document.createElement('a');
-    details.className = 'result-details'; name.textContent = photo.name; link.href = image.src;
-    link.download = photo.name.replace(/\.[^.]+$/, '') + '.jpg'; link.textContent = 'Télécharger ↓'; details.append(name, link); wrap.append(details);
+    const details = document.createElement('div'), link = document.createElement('a');
+    details.className = 'result-details'; link.href = `/api/client/photos/${photo.id}/image?gallery_id=${encodeURIComponent(clientGalleryId)}`;
+    link.download = photo.name.replace(/\.[^.]+$/, '') + '.jpg'; link.textContent = 'Télécharger ↓'; details.append(link); wrap.append(details);
   } else if (allowed('can_delete') && !selectedGallery.archived) {
     const remove = action('×', async () => {
       if (!confirm(`Supprimer définitivement ${photo.name} ?`)) return;
@@ -47,14 +56,19 @@ function formatBytes(bytes) {
 }
 async function refreshStorage() {
   const user = await api('/api/me');
-  $('#storage-usage').textContent = `Stockage des photos : ${formatBytes(user.used_bytes)} utilisés / ${user.quota_bytes === null ? 'illimité' : formatBytes(user.quota_bytes)}`;
+  $('#storage-usage').textContent = `Stockage des photos : ${formatBytes(user.used_bytes)} utilisés / ${user.quota_bytes === null ? 'illimité' : formatBytes(user.quota_bytes)}` + (user.pending_bytes ? ` · ${formatBytes(user.pending_bytes)} en attente` : '');
 }
 async function refresh() {
   if (!selectedGallery) return;
   const photos = await api(galleryURL('/api/photos'));
   $('#count').textContent = `${photos.length} photo(s) importée(s)`;
-  $('#library').replaceChildren(...photos.map(photo => card(photo)));
+  $('#library').replaceChildren(...photos.map(photo => card(photo, false, photos)));
   $('#clear').hidden = !photos.length || !allowed('can_delete') || Boolean(selectedGallery.archived);
+}
+async function copyClientLink(link) {
+  const url = new URL(link.path, location.origin).href + '#' + link.token;
+  try { await navigator.clipboard.writeText(url); $('#gallery-status').textContent = 'Lien copié.'; }
+  catch (error) { $('#client-link').value = url; $('#share-result').hidden = false; $('#client-link').select(); $('#gallery-status').textContent = 'Copiez le lien sélectionné.'; }
 }
 async function refreshLinks() {
   $('#links').replaceChildren();
@@ -63,9 +77,19 @@ async function refreshLinks() {
   for (const link of links) {
     const item = document.createElement('li'), active = link.expires * 1000 > Date.now();
     const modeLabel = {gallery:'Galerie',search:'Selfie',both:'Galerie et selfie'}[link.mode];
-    item.textContent = `${modeLabel} · ` + (active ? `Expire le ${new Date(link.expires * 1000).toLocaleString()} ` : 'Expiré ou révoqué');
-    if (active) item.append(action('Révoquer', async () => {
-      if (!confirm('Révoquer ce lien et ses sessions clients ?')) return;
+    item.textContent = `${link.name} · ${modeLabel} · ` + (active ? `Expire le ${new Date(link.expires * 1000).toLocaleString()} ` : 'Expiré ou révoqué ');
+    if (active && link.token) {
+      item.append(action('Copier', () => copyClientLink(link)));
+      item.append(action('QR code', async () => {
+        const response = await fetch('/api/client-qr', jsonRequest('POST', {token:link.token}));
+        if (!response.ok) throw new Error('Impossible de générer le QR code.');
+        const image = $('#link-qr-image');
+        if (image.src.startsWith('blob:')) URL.revokeObjectURL(image.src);
+        image.src = URL.createObjectURL(await response.blob()); $('#link-qr-title').textContent = link.name; $('#link-qr-dialog').showModal();
+      }));
+    } else if (active) item.append(document.createTextNode('Ancien lien : recréez-le pour pouvoir le recopier. '));
+    item.append(action('Supprimer', async () => {
+      if (!confirm('Supprimer ce lien et couper ses accès clients ?')) return;
       await api(`/api/client-links/${link.id}`, {method:'DELETE'}); $('#share-result').hidden = true; await refreshLinks();
     }));
     $('#links').append(item);
@@ -87,15 +111,16 @@ async function selectGallery(id) {
   selectedGallery = galleryList.find(gallery => gallery.id === id);
   $('#gallery-workspace').hidden = !selectedGallery;
   $('#rename-gallery').hidden = $('#archive-gallery').hidden = !selectedGallery;
+  $('#gallery-branding').hidden = !selectedGallery;
   if (!selectedGallery) return;
   $('#selected-gallery-name').textContent = selectedGallery.name;
-  failedUploads = []; $('#retry-upload').hidden = true; $('#upload-details').replaceChildren();
+  if (!processingFiles.size) { failedUploads = []; $('#retry-upload').hidden = true; $('#upload-details').replaceChildren(); }
   $('#upload-status').textContent = ''; $('#share-result').hidden = true; $('#upload-progress').hidden = true;
   const owner = me.role === 'admin' || me.id === selectedGallery.owner_id;
   $('#rename-gallery').hidden = $('#archive-gallery').hidden = !owner || !allowed('can_create_galleries');
+  $('#gallery-branding').hidden = !owner || !allowed('can_create_galleries');
+  $('#branding-accent').value = selectedGallery.accent_color; $('#branding-background').value = selectedGallery.background_color;
   $('#delete-gallery').hidden = !owner || !allowed('can_delete');
-  $('#auto-cover').hidden = !owner || !allowed('can_create_galleries');
-  $('#auto-cover').disabled = Boolean(selectedGallery.archived);
   $('#archive-gallery').textContent = selectedGallery.archived ? 'Activer la galerie' : 'Désactiver la galerie';
   photoInput.disabled = Boolean(selectedGallery.archived) || !allowed('can_upload');
   $('#generate-link').disabled = Boolean(selectedGallery.archived) || !allowed('can_share');
@@ -106,15 +131,15 @@ async function selectGallery(id) {
 }
 function renderGalleries() {
   $('#gallery-list').replaceChildren(...galleryList.map(gallery => {
-    const item = document.createElement('li'), button = document.createElement('button');
-    button.className = 'gallery-row'; button.type = 'button'; button.disabled = uploading;
+    const item = document.createElement('li'), button = document.createElement('a');
+    button.className = 'gallery-row'; button.href = photographerGalleryPath(gallery); button.setAttribute('aria-disabled', String(uploading));
     if (selectedGallery?.id === gallery.id) button.setAttribute('aria-current', 'true');
     if (gallery.thumbnail_id) {
-      const image = document.createElement('img'); image.src = `/api/photos/${gallery.thumbnail_id}/image`; image.alt = ''; image.loading = 'lazy'; button.append(image);
+      const image = document.createElement('img'); image.src = `/api/photos/${gallery.thumbnail_id}/thumbnail`; pendingThumbnails.add(image); image.alt = ''; image.loading = 'lazy'; button.append(image);
     } else { const empty = document.createElement('span'); empty.className = 'gallery-placeholder'; empty.textContent = '▧'; button.append(empty); }
     const text = document.createElement('span'), title = document.createElement('strong'), detail = document.createElement('small');
-    title.textContent = gallery.name; detail.textContent = `${gallery.photo_count} photo(s)` + (gallery.archived ? ' · Désactivée' : ''); text.append(title, detail); button.append(text);
-    button.addEventListener('click', async () => { if (uploading) return; try { await selectGallery(gallery.id); renderGalleries(); } catch (error) { message(error); } });
+    title.textContent = gallery.name; detail.textContent = `${gallery.photo_count} photo(s)` + (gallery.pending_count ? ` · ${gallery.pending_count} à traiter` : '') + (gallery.archived ? ' · Désactivée' : ''); text.append(title, detail); button.append(text);
+    button.addEventListener('click', event => { if (uploading) event.preventDefault(); });
     item.append(button); return item;
   }));
 }
@@ -127,32 +152,32 @@ const UPLOAD_CONCURRENCY = 3;
 function uploadOne(file, galleryId, update) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(), data = new FormData(); data.append('files', file);
-    xhr.open('POST', `/api/photos?gallery_id=${encodeURIComponent(galleryId)}`);
+    xhr.open('POST', `/api/photo-jobs?gallery_id=${encodeURIComponent(galleryId)}`);
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) update('transfer', event.loaded / event.total);
     };
-    xhr.upload.onload = () => update('analysis', 1);
+    xhr.upload.onload = () => update('saving', 1);
     xhr.onerror = () => reject(new Error('Connexion interrompue. Vérifiez la galerie avant de réessayer.'));
     xhr.onload = () => {
       try {
         const result = JSON.parse(xhr.responseText);
         if (xhr.status < 200 || xhr.status >= 300) throw new Error(typeof result.detail === 'string' ? result.detail : 'Import impossible.');
-        if (!Array.isArray(result) || !result[0]) throw new Error('Réponse d’import invalide.');
-        resolve(result[0]);
+        if (!result.id) throw new Error('Réponse d’import invalide.');
+        resolve(result);
       } catch (error) { reject(error); }
     };
     xhr.send(data);
   });
 }
 function uploadControls(disabled) {
-  for (const selector of ['#photos','#open-create-gallery','#clear','#rename-gallery','#archive-gallery','#auto-cover','#delete-gallery']) $(selector).disabled = disabled;
+  for (const selector of ['#photos','#open-create-gallery','#clear','#rename-gallery','#archive-gallery','#delete-gallery']) $(selector).disabled = disabled;
   for (const button of document.querySelectorAll('#library button')) button.disabled = disabled;
   renderGalleries();
 }
 async function uploadBatch(files) {
   if (!files.length || uploading || !selectedGallery) return;
   const galleryId = selectedGallery.id; uploading = true; stopUpload = false; failedUploads = [];
-  uploadControls(true);
+  uploadControls(true); toastDismissed = false; $('#upload-toast').hidden = false;
   $('#cancel-upload').hidden = false; $('#retry-upload').hidden = true; $('#upload-progress').hidden = false;
   $('#upload-progress').value = 0; $('#upload-details').replaceChildren();
   const states = files.map(file => {
@@ -164,10 +189,10 @@ async function uploadBatch(files) {
     const transferred = states.reduce((sum, item) => sum + item.fraction * (item.file.size || 1), 0);
     const total = states.reduce((sum, item) => sum + (item.file.size || 1), 0);
     const done = states.filter(item => item.phase === 'done').length;
-    const analysis = states.filter(item => item.phase === 'analysis').length;
+    const analysis = states.filter(item => item.phase === 'saving').length;
     const transfer = states.filter(item => item.phase === 'transfer').length;
     $('#upload-progress').value = transferred / total * 100;
-    $('#upload-status').textContent = `Transfert ${Math.round(transferred / total * 100)} % · ${transfer} envoi(s) · ${analysis} analyse(s) en cours ou en attente · ${done}/${files.length} terminée(s).` + (stopUpload ? ' Arrêt demandé : fin des photos en cours.' : '');
+    $('#upload-status').textContent = `Transfert ${Math.round(transferred / total * 100)} % · ${transfer} envoi(s) · ${analysis} enregistrement(s) sur le serveur · ${done}/${files.length} terminée(s).` + (stopUpload ? ' Arrêt demandé : fin des photos en cours.' : '');
   }
   async function worker() {
     while (!stopUpload && cursor < states.length) {
@@ -176,12 +201,13 @@ async function uploadBatch(files) {
       try {
         const result = await uploadOne(state.file, galleryId, (phase, fraction) => {
           state.phase = phase; state.fraction = fraction;
-          state.row.textContent = `${state.file.name} : ${phase === 'transfer' ? `transfert ${Math.round(fraction * 100)} %` : 'analyse des visages (en cours ou en attente)'}`;
+          state.row.textContent = `${state.file.name} : ${phase === 'transfer' ? `transfert ${Math.round(fraction * 100)} %` : 'enregistrement sur le serveur'}`;
           updateProgress();
         });
         if (result.error) throw new Error(result.error);
-        state.phase = 'done'; state.fraction = 1;
-        state.row.textContent = `${state.file.name} : ${result.faces} visage(s) — terminé`;
+        state.phase = 'queued'; state.fraction = 1; state.jobId = result.id;
+        processingFiles.set(result.id,state);
+        state.row.textContent = `${state.file.name} : en attente de traitement sur le serveur`;
       } catch (error) {
         state.phase = 'error'; state.error = error.message; state.row.textContent = `${state.file.name} : ${error.message}`;
       }
@@ -190,20 +216,90 @@ async function uploadBatch(files) {
   }
   try {
     await Promise.all(Array.from({length:Math.min(UPLOAD_CONCURRENCY, files.length)}, () => worker()));
-    failedUploads = states.filter(state => state.phase !== 'done').map(state => state.file);
+    failedUploads = states.filter(state => state.phase === 'error' || state.phase === 'waiting').map(state => state.file);
     for (const state of states.filter(state => state.phase === 'waiting')) state.row.textContent = `${state.file.name} : non envoyée (arrêt demandé)`;
-    const completed = states.filter(state => state.phase === 'done').length;
-    $('#upload-status').textContent = `${completed}/${files.length} photo(s) importée(s). ${failedUploads.length} restante(s) ou en erreur.` + (stopUpload ? ' Import arrêté après les photos en cours.' : '');
-    await refresh(); galleryList = await api('/api/galleries'); await refreshStorage();
+    const completed = states.filter(state => state.phase === 'queued').length;
+    $('#upload-status').textContent = `${completed}/${files.length} photo(s) envoyée(s). Le traitement continue sur le serveur. ${failedUploads.length} restante(s) ou en erreur.` + (stopUpload ? ' Import arrêté après les photos en cours.' : '');
+    await refresh(); galleryList = await api('/api/galleries'); await refreshStorage(); await pollGalleryProcessing();
   } catch (error) { $('#upload-status').textContent = error.message; }
   finally {
     uploading = false; photoInput.value = ''; uploadControls(false);
     photoInput.disabled = Boolean(selectedGallery.archived) || !allowed('can_upload');
-    $('#auto-cover').disabled = Boolean(selectedGallery.archived);
-    $('#cancel-upload').hidden = true; $('#retry-upload').hidden = !failedUploads.length;
+      $('#cancel-upload').hidden = true; $('#retry-upload').hidden = !failedUploads.length;
   }
 }
+async function pollGalleryProcessing() {
+  if (backgroundPolling) return;
+  backgroundPolling = true;
+  try {
+    const galleries = await api('/api/galleries');
+    const latest = galleries.find(gallery => gallery.id === selectedGallery?.id);
+    const changed = latest && latest.photo_count !== selectedGallery.photo_count;
+    galleryList = galleries; renderGalleries();
+    if (!latest) return;
+    Object.assign(selectedGallery,latest);
+    const status = await api(galleryURL('/api/photo-jobs'));
+    $('#gallery-processing-status').textContent = status.remaining ? `Traitement en cours : ${status.remaining} photo(s) restante(s).` : '';
+    const jobs = [...status.jobs];
+    const ids = [...processingFiles.keys()];
+    for (let index=0; index<ids.length; index+=100) {
+      const extra = await api(galleryURL('/api/photo-jobs')+'&ids='+ids.slice(index,index+100).join(',')); jobs.push(...extra.jobs);
+    }
+    if (!processingFiles.size && !uploading && status.remaining) {
+      $('#upload-details').replaceChildren(...status.jobs.filter(job => ['queued','processing'].includes(job.status)).map(job => { const row = document.createElement('li'); row.textContent = `${job.name} : ${job.status === 'processing' ? 'analyse des visages' : 'en attente sur le serveur'}`; return row; }));
+    }
+    for (const job of jobs) {
+      const state = processingFiles.get(job.id);
+      if (!state) continue;
+      state.phase = job.status;
+      state.row.textContent = `${job.name} : ` + ({queued:'en attente sur le serveur',processing:'analyse des visages',done:`${job.faces} visage(s) — terminé`,error:job.error}[job.status]);
+      if (job.status === 'error' && state.file && !failedUploads.includes(state.file)) failedUploads.push(state.file);
+      if (job.status === 'done' || job.status === 'error') processingFiles.delete(job.id);
+    }
+    if (!uploading && status.remaining) {
+      if (!toastDismissed) $('#upload-toast').hidden = false;
+      $('#upload-status').textContent = `Traitement en arrière-plan : ${status.remaining} photo(s) restante(s). Vous pouvez naviguer dans vos galeries.`;
+    } else if (!uploading && processingFiles.size === 0 && !$('#upload-toast').hidden) $('#upload-status').textContent = 'Traitement terminé.' + (failedUploads.length ? ` ${failedUploads.length} photo(s) en erreur.` : '');
+    $('#retry-upload').hidden = uploading || !failedUploads.length;
+    if (changed) { await refresh(); await refreshStorage(); }
+  } catch(error) { if (!uploading) $('#gallery-processing-status').textContent = error.message; }
+  finally { backgroundPolling = false; }
+}
+async function refreshThumbnails() {
+  for (const image of [...pendingThumbnails].slice(0,20)) {
+    pendingThumbnails.delete(image);
+    if (!image.isConnected) continue;
+    try {
+      const response = await fetch(image.src,{method:'HEAD'});
+      if (!response.ok) continue;
+      if (response.headers.get('X-Thumbnail-Ready') === '1') image.src += (image.src.includes('?') ? '&' : '?')+'small=1';
+      else pendingThumbnails.add(image);
+    } catch(error) { pendingThumbnails.add(image); }
+  }
+}
+if (photoInput || selfieInput) setInterval(refreshThumbnails,3000);
 if (photoInput) {
+  let dragDepth = 0;
+  const fileDrag = event => Array.from(event.dataTransfer?.types || []).includes('Files');
+  document.addEventListener('dragenter', event => { if (!fileDrag(event)) return; event.preventDefault(); dragDepth++; $('#drop-overlay').hidden = false; $('#drop-message').textContent = !selectedGallery ? 'Ouvrez une galerie pour importer vos photos.' : uploading ? 'Un envoi est déjà en cours.' : 'Elles seront importées dans cette galerie.'; });
+  document.addEventListener('dragover', event => { if (fileDrag(event)) event.preventDefault(); });
+  document.addEventListener('dragleave', event => { if (!fileDrag(event)) return; dragDepth = Math.max(0,dragDepth-1); if (!dragDepth) $('#drop-overlay').hidden = true; });
+  document.addEventListener('drop', event => { if (!fileDrag(event)) return; event.preventDefault(); dragDepth = 0; $('#drop-overlay').hidden = true; if (!selectedGallery || photoInput.disabled) { $('#gallery-status').textContent = 'Ouvrez une galerie active avec la permission d’importer.'; return; } uploadBatch(Array.from(event.dataTransfer.files)); });
+  window.addEventListener('beforeunload', event => { if (uploading) { event.preventDefault(); event.returnValue = ''; } });
+  $('#upload-toast-close').addEventListener('click', () => { toastDismissed = true; $('#upload-toast').hidden = true; });
+  setInterval(pollGalleryProcessing,2000);
+  $('#branding-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    try { await api(`/api/galleries/${selectedGallery.id}`, jsonRequest('PATCH', {accent_color:$('#branding-accent').value,background_color:$('#branding-background').value})); $('#branding-status').textContent = 'Couleurs enregistrées pour les liens clients de cette galerie.'; } catch(error) { $('#branding-status').textContent = error.message; }
+  });
+  $('#branding-logo').addEventListener('change', async event => {
+    const file = event.target.files[0]; if (!file) return; const data = new FormData(); data.append('file',file); event.target.disabled = true;
+    try { await api(`/api/galleries/${selectedGallery.id}/logo`, {method:'POST',body:data}); $('#branding-status').textContent = 'Logo enregistré.'; await refreshStorage(); } catch(error) { $('#branding-status').textContent = error.message; } finally { event.target.disabled = false; event.target.value = ''; }
+  });
+  $('#remove-branding-logo').addEventListener('click', async () => {
+    try { await api(`/api/galleries/${selectedGallery.id}/logo`, {method:'DELETE'}); $('#branding-status').textContent = 'Logo PhotoFind rétabli.'; await refreshStorage(); } catch(error) { $('#branding-status').textContent = error.message; }
+  });
+  $('#link-qr-close').addEventListener('click', () => $('#link-qr-dialog').close());
   photoInput.addEventListener('change', () => uploadBatch(Array.from(photoInput.files)));
   $('#cancel-upload').addEventListener('click', () => { stopUpload = true; $('#upload-status').textContent = 'Arrêt demandé : fin des photos déjà en cours.'; });
   $('#retry-upload').addEventListener('click', () => uploadBatch([...failedUploads]));
@@ -220,14 +316,10 @@ if (photoInput) {
     const button = event.currentTarget.querySelector('button[type=submit]'); button.disabled = true;
     try {
       const result = await api(`/api/galleries/${selectedGallery.id}`, {method:'DELETE'});
-      $('#delete-gallery-dialog').close(); await loadGalleries(); await refreshStorage();
+      $('#delete-gallery-dialog').close(); location.assign('/');
       $('#gallery-status').textContent = result.cleanup_pending ? 'Galerie supprimée, mais le nettoyage disque a échoué. Consultez les journaux serveur.' : `Galerie supprimée, ${result.photos_deleted} photo(s) effacée(s).`;
     } catch (error) { $('#delete-gallery-status').textContent = error.message; }
     finally { button.disabled = false; }
-  });
-  $('#auto-cover').addEventListener('click', async () => {
-    if (uploading) return;
-    try { await api(`/api/galleries/${selectedGallery.id}`, jsonRequest('PATCH', {cover_photo_id:null})); await loadGalleries(selectedGallery.id); $('#gallery-status').textContent = 'Miniature automatique activée : la dernière photo importée est utilisée.'; } catch (error) { message(error); }
   });
   $('#create-gallery').addEventListener('submit', async event => {
     event.preventDefault(); if (uploading) return;
@@ -235,7 +327,7 @@ if (photoInput) {
     try {
       const gallery = await api('/api/galleries', jsonRequest('POST', {name:new FormData(form).get('name')}));
       form.reset(); $('#create-gallery-dialog').close(); $('#gallery-status').textContent = 'Galerie créée.';
-      await loadGalleries(gallery.id);
+      location.assign(photographerGalleryPath(gallery));
     } catch (error) { $('#create-gallery-status').textContent = error.message; }
     finally { button.disabled = false; }
   });
@@ -251,7 +343,7 @@ if (photoInput) {
   });
   $('#clear').addEventListener('click', async () => {
     if (!confirm('Supprimer définitivement toutes les photos de cette galerie ?')) return;
-    try { await api(galleryURL('/api/photos'), {method:'DELETE'}); await refresh(); await refreshStorage(); } catch (error) { message(error); }
+    try { await api(galleryURL('/api/photos'), {method:'DELETE'}); processingFiles.clear(); failedUploads = []; $('#upload-toast').hidden = true; await refresh(); await refreshStorage(); } catch (error) { message(error); }
   });
   $('#add-member').addEventListener('submit', async event => {
     event.preventDefault();
@@ -260,7 +352,7 @@ if (photoInput) {
   $('#generate-link').addEventListener('click', async () => {
     $('#generate-link').disabled = true;
     try {
-      const result = await api('/api/client-links', jsonRequest('POST', {gallery_id:selectedGallery.id, days:Number($('#link-days').value), mode:$('#link-mode').value}));
+      const result = await api('/api/client-links', jsonRequest('POST', {gallery_id:selectedGallery.id, days:Number($('#link-days').value), mode:$('#link-mode').value, name:$('#link-name').value}));
       const link = new URL(result.path, location.origin).href + '#' + result.token;
       const qr = await fetch('/api/client-qr', jsonRequest('POST', {token:result.token}));
       if (!qr.ok) throw new Error('Impossible de générer le QR code.');
@@ -276,7 +368,9 @@ if (photoInput) {
   });
   api('/api/me').then(async user => {
     me = user; $('#admin-link').hidden = user.role !== 'admin'; $('#open-create-gallery').hidden = !allowed('can_create_galleries');
-    await loadGalleries(); await refreshStorage();
+    const galleryId = (location.pathname || '/').match(/^\/galeries\/([^/]+)/)?.[1];
+    $('#gallery-home').hidden = Boolean(galleryId);
+    await loadGalleries(galleryId); await refreshStorage(); await pollGalleryProcessing();
   }).catch(message);
 }
 $('#logout')?.addEventListener('click', async () => { await api('/api/logout', {method:'POST'}); location.assign('/login'); });
@@ -287,6 +381,13 @@ if (selfieInput) {
   selfieInput.disabled = true;
   const ready = token ? api('/api/client/redeem', jsonRequest('POST', {token, gallery_id:galleryInPath})) : api('/api/client/session' + (galleryInPath ? `?gallery_id=${encodeURIComponent(galleryInPath)}` : ''));
   ready.then(async session => {
+    document.documentElement.style.setProperty('--brand-accent',session.accent_color);
+    document.documentElement.style.setProperty('--brand-background',session.background_color);
+    const brightness = color => .299 * parseInt(color.slice(1,3),16) + .587 * parseInt(color.slice(3,5),16) + .114 * parseInt(color.slice(5,7),16);
+    document.documentElement.style.setProperty('--brand-button-ink',brightness(session.accent_color)>170 ? '#172015' : '#ffffff');
+    document.documentElement.style.setProperty('--brand-ink',brightness(session.background_color)>140 ? '#262d29' : '#f5f7f4');
+    document.documentElement.style.setProperty('--brand-link',brightness(session.accent_color)>200 ? '#465f45' : session.accent_color);
+    if (session.logo) { const logo = document.createElement('img'); logo.className = 'gallery-logo'; logo.alt = 'Logo du photographe'; logo.src = `/api/client/logo?gallery_id=${encodeURIComponent(session.gallery_id)}`; $('#client-brand').replaceChildren(logo); }
     clientGalleryId = session.gallery_id; clientReady = session.mode !== 'gallery';
     $('#client-title').textContent = session.gallery_name;
     $('#client-description').textContent = {gallery:'Consultez et téléchargez les photos de cette galerie.',search:'Prenez ou choisissez un selfie pour retrouver vos photos.',both:'Consultez la galerie ou utilisez un selfie pour retrouver vos photos.'}[session.mode];
@@ -294,7 +395,7 @@ if (selfieInput) {
     $('#client-gallery-title').textContent = session.gallery_name;
     if (session.mode !== 'search') {
       const photos = await api(`/api/client/photos?gallery_id=${encodeURIComponent(clientGalleryId)}`);
-      $('#client-gallery').replaceChildren(...photos.map(photo => card(photo, true)));
+      $('#client-gallery').replaceChildren(...photos.map(photo => card(photo, true, photos)));
       $('#client-gallery-section').hidden = false;
       $('#client-status').textContent = photos.length ? '' : 'Cette galerie ne contient pas encore de photos.';
     }
@@ -306,7 +407,8 @@ if (selfieInput) {
     try {
       const results = await api(`/api/search?gallery_id=${encodeURIComponent(clientGalleryId)}`, {method:'POST', body:data});
       $('#search-status').textContent = results.length ? 'Recherche terminée.' : 'Aucune photo correspondante. Essayez un selfie bien éclairé.';
-      $('#results').replaceChildren(...results.map(photo => card(photo, true))); $('#result-count').textContent = `${results.length} photo(s)`; $('#results-section').hidden = false;
+      $('#results').replaceChildren(...results.map(photo => card(photo, true, results))); $('#result-count').textContent = results.length ? `Hey, ${results.length} photo${results.length > 1 ? 's trouvées' : ' trouvée'} !` : 'Aucune photo trouvée pour ce selfie.'; $('#results-section').hidden = false;
+      $('#result-count').focus({preventScroll:true}); $('#results-section').scrollIntoView({behavior:'smooth', block:'start'});
     } catch (error) { $('#search-status').textContent = error.message; }
     finally { selfieInput.disabled = false; selfieInput.value = ''; }
   });

@@ -135,4 +135,30 @@ def initialize_user_directory(db, root, user_id, username):
 
 
 def storage_usage(db, user_id):
-    return db.execute('SELECT COALESCE(SUM(p.bytes),0) FROM photos p JOIN galleries g ON g.id=p.gallery_id WHERE g.owner_id=?', (user_id,)).fetchone()[0]
+    return db.execute('SELECT COALESCE((SELECT SUM(p.bytes+p.thumbnail_bytes) FROM photos p JOIN galleries g ON g.id=p.gallery_id WHERE g.owner_id=?),0) + COALESCE((SELECT SUM(branding_bytes) FROM galleries WHERE owner_id=?),0)', (user_id,user_id)).fetchone()[0]
+
+
+
+def signing_key(directory):
+    import os
+    path = directory / 'link-signing.key'
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        key = path.read_bytes()
+        if len(key) != 32:
+            raise RuntimeError('Clé de liens invalide. Restaurez-la depuis une sauvegarde.')
+        return key
+    key = secrets.token_bytes(32)
+    with os.fdopen(descriptor, 'wb') as stream:
+        stream.write(key); stream.flush(); os.fsync(stream.fileno())
+    return key
+
+
+def link_token(key, nonce):
+    return nonce + '.' + hmac.new(key, nonce.encode(), hashlib.sha256).hexdigest()
+
+
+
+def pending_usage(db, user_id, exclude_job=None):
+    return db.execute("SELECT COALESCE(SUM(j.input_bytes),0) FROM photo_jobs j JOIN galleries g ON g.id=j.gallery_id WHERE g.owner_id=? AND j.status IN ('queued','processing') AND (? IS NULL OR j.id!=?)", (user_id,exclude_job,exclude_job)).fetchone()[0]

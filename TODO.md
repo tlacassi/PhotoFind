@@ -110,3 +110,24 @@ n'est pas considérée comme déployée.
 
 - Migration locale appliquée après sauvegarde : 95 images préexistantes conservées,
   contrôlées par SHA-256 ; serveur local redémarré avec le nouveau code.
+
+### Navigation, présentation et traitement durable
+- [x] Résultats du selfie en haut, message avec le nombre de photos et défilement.
+- [x] Retirer les noms de fichiers et le badge « Espace client » de la vue client.
+- [x] Visionneuse client et photographe, précédent/suivant, clavier et téléchargement.
+- [x] Accueil photographe distinct et page dédiée par galerie.
+- [x] Liens nommés avec copie, QR code réouvrable et suppression effective de la liste.
+- [x] Glisser-déposer avec voile, panneau de progression et compteur sur les galeries.
+- [x] File de traitement persistante, reprise et déduplication au redémarrage.
+- [x] Miniatures en arrière-plan avec repli sur le JPEG principal et mise à jour de la grille.
+- [x] Retirer le bouton de miniature automatique, conserver le choix par étoile.
+- [x] Personnalisation par galerie : couleurs et logo, avec PhotoFind par défaut.
+- [x] Sauvegarder/restaurer la clé nécessaire pour recopier les nouveaux liens.
+- [x] Annuler les traitements en attente lors de l’effacement des photos ou de la galerie.
+- Validation automatisée : API, reprise de traitements, permissions, QR, fichiers,
+  navigation de visionneuse et structure HTML. Vérification visuelle navigateur restante.
+
+- Livraison locale : sauvegarde effectuée, serveur redémarré ; 95 photos préexistantes
+  vérifiées par SHA-256 et 95 miniatures générées sans modification des JPEG principaux.
+- 27 tests automatisés passent. Le déploiement public Portainer et la validation
+  visuelle dans un navigateur restent des étapes distinctes.
