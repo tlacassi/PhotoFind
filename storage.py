@@ -39,9 +39,11 @@ def initialize(path: Path):
             db.execute("UPDATE client_links SET gallery_id='legacy' WHERE gallery_id IS NULL")
         if 'bytes' not in {row['name'] for row in db.execute('PRAGMA table_info(photos)')}:
             db.execute('ALTER TABLE photos ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0')
-        for name, definition in [('job_id','TEXT'),('thumbnail_bytes','INTEGER NOT NULL DEFAULT 0'),('thumbnail_status','INTEGER NOT NULL DEFAULT 0')]:
+        for name, definition in [('job_id','TEXT'),('thumbnail_bytes','INTEGER NOT NULL DEFAULT 0'),('thumbnail_status','INTEGER NOT NULL DEFAULT 0'),('content_hash','TEXT'),('encoded_hash','TEXT')]:
             if name not in {row['name'] for row in db.execute('PRAGMA table_info(photos)')}:
                 db.execute(f'ALTER TABLE photos ADD COLUMN {name} {definition}')
+        db.execute('CREATE INDEX IF NOT EXISTS photos_content ON photos(gallery_id,content_hash)')
+        db.execute('CREATE INDEX IF NOT EXISTS photos_encoded ON photos(gallery_id,encoded_hash)')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS photos_job ON photos(job_id)')
         db.execute("CREATE TABLE IF NOT EXISTS photo_jobs (id TEXT PRIMARY KEY, gallery_id TEXT NOT NULL REFERENCES galleries(id), user_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, input_path TEXT NOT NULL, input_bytes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued', error TEXT, faces INTEGER, photo_id TEXT, created INTEGER NOT NULL)")
         db.execute('CREATE INDEX IF NOT EXISTS photo_jobs_gallery ON photo_jobs(gallery_id,status)')
@@ -125,7 +127,7 @@ def organize_photos(path, root):
                 gallery_directory(db, root, gallery['id']).mkdir(exist_ok=True)
         # Commit folder mapping before moving files, so a restart uses the same paths.
         db.commit()
-        for photo in db.execute('SELECT id,gallery_id FROM photos'):
+        for photo in db.execute('SELECT id,gallery_id,encoded_hash FROM photos'):
             if len(photo['id']) != 32 or any(char not in '0123456789abcdef' for char in photo['id']):
                 raise ValueError('Identifiant de photo invalide pendant la migration.')
             filename = photo['id'] + '.jpg'
@@ -138,3 +140,10 @@ def organize_photos(path, root):
                     source.rename(destination)
             if destination.is_file():
                 db.execute('UPDATE photos SET bytes=? WHERE id=?', (destination.stat().st_size, photo['id']))
+                if photo['encoded_hash'] is None:
+                    import hashlib
+                    digest = hashlib.sha256()
+                    with destination.open('rb') as stream:
+                        for chunk in iter(lambda: stream.read(1024*1024),b''):
+                            digest.update(chunk)
+                    db.execute('UPDATE photos SET encoded_hash=? WHERE id=?',(digest.hexdigest(),photo['id']))

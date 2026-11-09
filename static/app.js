@@ -21,12 +21,22 @@ function action(text, handler) {
   const button = document.createElement('button'); button.type = 'button'; button.className = 'text-button'; button.textContent = text;
   button.addEventListener('click', () => Promise.resolve().then(handler).catch(message)); return button;
 }
+function applyGalleryColors(colors) {
+  const valid = color => typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color);
+  const accent = valid(colors?.accent_color) ? colors.accent_color : '#789a78';
+  const background = valid(colors?.background_color) ? colors.background_color : '#f8f7f1';
+  const brightness = color => .299 * parseInt(color.slice(1,3),16) + .587 * parseInt(color.slice(3,5),16) + .114 * parseInt(color.slice(5,7),16);
+  const variables = {'--brand-accent':accent, '--brand-background':background, '--brand-button-ink':brightness(accent)>170 ? '#172015' : '#ffffff', '--brand-ink':brightness(background)>140 ? '#262d29' : '#f5f7f4', '--brand-link':brightness(accent)>200 ? '#465f45' : accent};
+  for (const [name,value] of Object.entries(variables)) document.documentElement.style.setProperty(name,value);
+  document.body.classList.toggle('gallery-themed',Boolean(colors));
+}
+let galleryColorDraft = null;
 function card(photo, download = false, collection = [photo]) {
-  const wrap = document.createElement('div'); wrap.className = download ? 'result' : 'thumb';
+  const wrap = document.createElement('div'); wrap.viewerPhotos = collection; wrap.className = download ? 'result' : 'thumb';
   const image = document.createElement('img'); image.src = download ? `/api/client/photos/${photo.id}/thumbnail?gallery_id=${encodeURIComponent(clientGalleryId)}` : `/api/photos/${photo.id}/thumbnail`;
-  pendingThumbnails.add(image); image.alt = download ? 'Photo de la galerie' : photo.name; image.loading = 'lazy';
+  if (!photo.thumbnail_ready) pendingThumbnails.add(image); image.alt = download ? 'Photo de la galerie' : photo.name; image.loading = 'lazy';
   const open = document.createElement('button'); open.type = 'button'; open.className = 'photo-open'; open.setAttribute('aria-label', 'Ouvrir la photo en grand'); open.append(image);
-  open.addEventListener('click', () => openPhotoViewer(collection, collection.findIndex(item => item.id === photo.id), {client:download, galleryId:clientGalleryId})); wrap.append(open);
+  open.addEventListener('click', () => openPhotoViewer(wrap.viewerPhotos, wrap.viewerPhotos.findIndex(item => item.id === photo.id), {client:download, galleryId:clientGalleryId})); wrap.append(open);
   if (download) {
     const details = document.createElement('div'), link = document.createElement('a');
     details.className = 'result-details'; link.href = `/api/client/photos/${photo.id}/image?gallery_id=${encodeURIComponent(clientGalleryId)}`;
@@ -58,11 +68,22 @@ async function refreshStorage() {
   const user = await api('/api/me');
   $('#storage-usage').textContent = `Stockage des photos : ${formatBytes(user.used_bytes)} utilisés / ${user.quota_bytes === null ? 'illimité' : formatBytes(user.quota_bytes)}` + (user.pending_bytes ? ` · ${formatBytes(user.pending_bytes)} en attente` : '');
 }
+const libraryCards = new Map();
+let libraryContext = null;
 async function refresh() {
   if (!selectedGallery) return;
   const photos = await api(galleryURL('/api/photos'));
   $('#count').textContent = `${photos.length} photo(s) importée(s)`;
-  $('#library').replaceChildren(...photos.map(photo => card(photo, false, photos)));
+  const list = $('#library'), context = `${selectedGallery.id}:${selectedGallery.archived}:${allowed('can_delete')}:${allowed('can_create_galleries')}`;
+  if (context !== libraryContext) { list.replaceChildren(); libraryCards.clear(); libraryContext = context; }
+  const present = new Set(photos.map(photo=>photo.id));
+  for (const [id,element] of libraryCards) if (!present.has(id)) { element.remove(); libraryCards.delete(id); }
+  photos.forEach((photo,index) => {
+    let element = libraryCards.get(photo.id);
+    if (!element) { element = card(photo,false,photos); libraryCards.set(photo.id,element); }
+    element.viewerPhotos = photos;
+    if (list.children[index] !== element) list.insertBefore(element,list.children[index] || null);
+  });
   $('#clear').hidden = !photos.length || !allowed('can_delete') || Boolean(selectedGallery.archived);
 }
 async function copyClientLink(link) {
@@ -112,6 +133,8 @@ async function selectGallery(id) {
   $('#gallery-workspace').hidden = !selectedGallery;
   $('#rename-gallery').hidden = $('#archive-gallery').hidden = !selectedGallery;
   $('#gallery-branding').hidden = !selectedGallery;
+  const palette = galleryColorDraft?.galleryId === selectedGallery?.id ? galleryColorDraft : selectedGallery;
+  applyGalleryColors(palette);
   if (!selectedGallery) return;
   $('#selected-gallery-name').textContent = selectedGallery.name;
   if (!processingFiles.size) { failedUploads = []; $('#retry-upload').hidden = true; $('#upload-details').replaceChildren(); }
@@ -119,7 +142,7 @@ async function selectGallery(id) {
   const owner = me.role === 'admin' || me.id === selectedGallery.owner_id;
   $('#rename-gallery').hidden = $('#archive-gallery').hidden = !owner || !allowed('can_create_galleries');
   $('#gallery-branding').hidden = !owner || !allowed('can_create_galleries');
-  $('#branding-accent').value = selectedGallery.accent_color; $('#branding-background').value = selectedGallery.background_color;
+  $('#branding-accent').value = palette.accent_color || '#789a78'; $('#branding-background').value = palette.background_color || '#f8f7f1';
   $('#delete-gallery').hidden = !owner || !allowed('can_delete');
   $('#archive-gallery').textContent = selectedGallery.archived ? 'Activer la galerie' : 'Désactiver la galerie';
   photoInput.disabled = Boolean(selectedGallery.archived) || !allowed('can_upload');
@@ -129,19 +152,36 @@ async function selectGallery(id) {
   if (selectedGallery.archived) $('#upload-status').textContent = 'Galerie désactivée : photos conservées, import et liens désactivés.';
   await Promise.all([refresh(), refreshLinks(), refreshMembers()]);
 }
+const galleryElements = new Map();
 function renderGalleries() {
-  $('#gallery-list').replaceChildren(...galleryList.map(gallery => {
-    const item = document.createElement('li'), button = document.createElement('a');
-    button.className = 'gallery-row'; button.href = photographerGalleryPath(gallery); button.setAttribute('aria-disabled', String(uploading));
-    if (selectedGallery?.id === gallery.id) button.setAttribute('aria-current', 'true');
-    if (gallery.thumbnail_id) {
-      const image = document.createElement('img'); image.src = `/api/photos/${gallery.thumbnail_id}/thumbnail`; pendingThumbnails.add(image); image.alt = ''; image.loading = 'lazy'; button.append(image);
-    } else { const empty = document.createElement('span'); empty.className = 'gallery-placeholder'; empty.textContent = '▧'; button.append(empty); }
-    const text = document.createElement('span'), title = document.createElement('strong'), detail = document.createElement('small');
-    title.textContent = gallery.name; detail.textContent = `${gallery.photo_count} photo(s)` + (gallery.pending_count ? ` · ${gallery.pending_count} à traiter` : '') + (gallery.archived ? ' · Désactivée' : ''); text.append(title, detail); button.append(text);
-    button.addEventListener('click', event => { if (uploading) event.preventDefault(); });
-    item.append(button); return item;
-  }));
+  const list = $('#gallery-list'), present = new Set(galleryList.map(gallery=>gallery.id));
+  for (const [id,entry] of galleryElements) {
+    if (!present.has(id)) { entry.item.remove(); galleryElements.delete(id); }
+  }
+  galleryList.forEach((gallery,index) => {
+    let entry = galleryElements.get(gallery.id);
+    if (!entry) {
+      const item = document.createElement('li'), link = document.createElement('a'), text = document.createElement('span'), title = document.createElement('strong'), detail = document.createElement('small');
+      link.className = 'gallery-row'; text.append(title,detail); link.append(text); item.append(link);
+      link.addEventListener('click',event=>{if(uploading)event.preventDefault();});
+      entry = {item,link,title,detail,thumbnailId:undefined,media:null}; galleryElements.set(gallery.id,entry);
+    }
+    entry.link.href = photographerGalleryPath(gallery); entry.link.setAttribute('aria-disabled',String(uploading));
+    entry.link.setAttribute('aria-current',selectedGallery?.id === gallery.id ? 'true' : 'false');
+    entry.title.textContent = gallery.name;
+    entry.detail.textContent = `${gallery.photo_count} photo(s)` + (gallery.pending_count ? ` · ${gallery.pending_count} à traiter` : '') + (gallery.archived ? ' · Désactivée' : '');
+    const thumbnailId = gallery.thumbnail_id || null;
+    if (entry.thumbnailId !== thumbnailId) {
+      const media = document.createElement(thumbnailId ? 'img' : 'span');
+      if (thumbnailId) {
+        media.src = `/api/photos/${thumbnailId}/thumbnail`; media.alt=''; media.loading='lazy';
+        if (!gallery.thumbnail_ready) pendingThumbnails.add(media);
+      } else { media.className='gallery-placeholder'; media.textContent='▧'; }
+      if (entry.media) entry.media.replaceWith(media); else entry.link.insertBefore(media,entry.link.firstChild);
+      entry.media=media; entry.thumbnailId=thumbnailId;
+    }
+    if (list.children[index] !== entry.item) list.insertBefore(entry.item,list.children[index] || null);
+  });
 }
 async function loadGalleries(preferred) {
   galleryList = await api('/api/galleries');
@@ -288,9 +328,25 @@ if (photoInput) {
   window.addEventListener('beforeunload', event => { if (uploading) { event.preventDefault(); event.returnValue = ''; } });
   $('#upload-toast-close').addEventListener('click', () => { toastDismissed = true; $('#upload-toast').hidden = true; });
   setInterval(pollGalleryProcessing,2000);
+  const previewColors = () => {
+    if (!selectedGallery) return;
+    galleryColorDraft = {galleryId:selectedGallery.id, accent_color:$('#branding-accent').value, background_color:$('#branding-background').value};
+    applyGalleryColors(galleryColorDraft);
+    $('#branding-status').textContent = 'Aperçu en direct. Enregistrez pour appliquer ces couleurs aux liens clients.';
+  };
+  for (const selector of ['#branding-accent','#branding-background']) {
+    $(selector).addEventListener('input',previewColors); $(selector).addEventListener('change',previewColors);
+  }
   $('#branding-form').addEventListener('submit', async event => {
     event.preventDefault();
-    try { await api(`/api/galleries/${selectedGallery.id}`, jsonRequest('PATCH', {accent_color:$('#branding-accent').value,background_color:$('#branding-background').value})); $('#branding-status').textContent = 'Couleurs enregistrées pour les liens clients de cette galerie.'; } catch(error) { $('#branding-status').textContent = error.message; }
+    const id = selectedGallery.id, colors = {accent_color:$('#branding-accent').value, background_color:$('#branding-background').value};
+    for (const selector of ['#branding-accent','#branding-background','#branding-save']) $(selector).disabled = true;
+    try {
+      await api(`/api/galleries/${id}`, jsonRequest('PATCH',colors));
+      Object.assign(selectedGallery,colors); galleryColorDraft = null; applyGalleryColors(colors);
+      $('#branding-status').textContent = 'Couleurs enregistrées pour cette galerie et ses liens clients.';
+    } catch(error) { $('#branding-status').textContent = error.message + ' L’aperçu reste visible, mais n’est pas enregistré.'; }
+    finally { for (const selector of ['#branding-accent','#branding-background','#branding-save']) $(selector).disabled = false; }
   });
   $('#branding-logo').addEventListener('change', async event => {
     const file = event.target.files[0]; if (!file) return; const data = new FormData(); data.append('file',file); event.target.disabled = true;
@@ -381,12 +437,7 @@ if (selfieInput) {
   selfieInput.disabled = true;
   const ready = token ? api('/api/client/redeem', jsonRequest('POST', {token, gallery_id:galleryInPath})) : api('/api/client/session' + (galleryInPath ? `?gallery_id=${encodeURIComponent(galleryInPath)}` : ''));
   ready.then(async session => {
-    document.documentElement.style.setProperty('--brand-accent',session.accent_color);
-    document.documentElement.style.setProperty('--brand-background',session.background_color);
-    const brightness = color => .299 * parseInt(color.slice(1,3),16) + .587 * parseInt(color.slice(3,5),16) + .114 * parseInt(color.slice(5,7),16);
-    document.documentElement.style.setProperty('--brand-button-ink',brightness(session.accent_color)>170 ? '#172015' : '#ffffff');
-    document.documentElement.style.setProperty('--brand-ink',brightness(session.background_color)>140 ? '#262d29' : '#f5f7f4');
-    document.documentElement.style.setProperty('--brand-link',brightness(session.accent_color)>200 ? '#465f45' : session.accent_color);
+    applyGalleryColors(session);
     if (session.logo) { const logo = document.createElement('img'); logo.className = 'gallery-logo'; logo.alt = 'Logo du photographe'; logo.src = `/api/client/logo?gallery_id=${encodeURIComponent(session.gallery_id)}`; $('#client-brand').replaceChildren(logo); }
     clientGalleryId = session.gallery_id; clientReady = session.mode !== 'gallery';
     $('#client-title').textContent = session.gallery_name;

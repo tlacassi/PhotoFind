@@ -21,16 +21,26 @@ pas envoyées à un service de reconnaissance externe.
   La file SQLite reprend les traitements interrompus au redémarrage ; un identifiant
   de traitement évite de dupliquer une photo déjà enregistrée lors de cette reprise.
   Les galeries indiquent le nombre de photos restantes.
+  Les doublons sont refusés dans une même galerie en comparant les pixels normalisés
+  et le JPEG conservé, sans utiliser le nom du fichier. Le contrôle est répété dans
+  la transaction d’écriture pour couvrir les imports simultanés. Une erreur par
+  fichier est affichée dans le panneau ; les anciennes photos ne sont pas supprimées.
+  Il ne s’agit pas d’une recherche approximative de photos ressemblantes.
 - **Miniatures et visionneuse** : un worker génère les aperçus de 480 pixels maximum
   dans `.thumbnails/` au sein de la galerie. En attendant, la grille utilise le JPEG
-  principal ; elle passe ensuite à l’aperçu. La visionneuse client et photographe
+  principal ; elle passe ensuite à l’aperçu. Les aperçus existants ne sont pas
+  recalculés lors d’un affichage. Le suivi de progression réutilise les éléments
+  d’image existants et seules les miniatures encore absentes sont vérifiées. La visionneuse client et photographe
   affiche le JPEG principal, avec précédent/suivant et navigation clavier. Le nom de
   fichier n’est pas affiché côté client. Les résultats du selfie sont placés en haut
   et annoncent directement leur nombre.
 - **Navigation et personnalisation** : l’accueil photographe liste les galeries ;
   chacune s’ouvre sur `/galeries/<id>/<nom>`. Le nom de l’URL peut changer sans casser
   l’identifiant. Une galerie peut définir sa couleur principale, son fond et son logo
-  PNG/JPEG/WebP (2 Mo maximum, réencodé en PNG). Par défaut, PhotoFind est conservé.
+  PNG/JPEG/WebP (2 Mo maximum, réencodé en PNG). Les couleurs choisies s’appliquent
+  immédiatement à la page du photographe comme aperçu. Le bouton Enregistrer
+  sauvegarde ces couleurs pour la galerie et ses liens clients. Par défaut,
+  PhotoFind est conservé.
 - **Clients sans compte** : lien privé et QR code associés à une galerie, validité
   de 1 à 90 jours, plusieurs liens simultanés avec des expirations indépendantes.
   Modes : galerie seule, selfie seul ou les deux. Le serveur contrôle les modes.

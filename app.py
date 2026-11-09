@@ -283,7 +283,13 @@ def gallery_access(db, gallery_id, user, permission=None, write=False, owner=Fal
 def galleries(user=Depends(auth.current_user)):
     with connect() as db:
         rows = db.execute("SELECT g.*, (SELECT count(*) FROM photos WHERE gallery_id=g.id) AS photo_count, (SELECT count(*) FROM photo_jobs WHERE gallery_id=g.id AND status IN ('queued','processing')) AS pending_count, COALESCE((SELECT p.id FROM photos p WHERE p.id=g.cover_photo_id AND p.gallery_id=g.id), (SELECT p.id FROM photos p WHERE p.gallery_id=g.id ORDER BY p.rowid DESC LIMIT 1)) AS thumbnail_id FROM galleries g WHERE ? OR g.owner_id=? OR EXISTS (SELECT 1 FROM gallery_members m WHERE m.gallery_id=g.id AND m.user_id=?) ORDER BY g.rowid DESC", (user['role'] == 'admin', user['id'], user['id'])).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            state = db.execute('SELECT thumbnail_status FROM photos WHERE id=?',(item['thumbnail_id'],)).fetchone()
+            item['thumbnail_ready'] = bool(state and state['thumbnail_status']==1)
+            result.append(item)
+        return result
 
 
 @app.post('/api/galleries', status_code=201)
@@ -638,18 +644,35 @@ def client_qr(payload: ClientToken, request: Request, user=Depends(auth.current_
 def list_photos(gallery_id: str, user=Depends(auth.current_user)):
     with connect() as db:
         gallery_access(db, gallery_id, user)
-        rows = db.execute('SELECT id, name, faces FROM photos WHERE gallery_id=? ORDER BY rowid DESC', (gallery_id,)).fetchall()
-    return [{'id': r['id'], 'name': r['name'], 'faces': len(json.loads(r['faces']))} for r in rows]
+        rows = db.execute('SELECT id, name, faces, thumbnail_status FROM photos WHERE gallery_id=? ORDER BY rowid DESC', (gallery_id,)).fetchall()
+    return [{'id': r['id'], 'name': r['name'], 'faces': len(json.loads(r['faces'])), 'thumbnail_ready':r['thumbnail_status']==1} for r in rows]
+
+
+def image_signature(image):
+    digest = hashlib.sha256(str(image.shape).encode('ascii'))
+    digest.update(image.tobytes(order='C'))
+    return digest.hexdigest()
+
+
+def reject_duplicate(db, gallery_id, content_hash, encoded_hash, original_hash):
+    if db.execute('SELECT 1 FROM photos WHERE gallery_id=? AND (content_hash=? OR encoded_hash IN (?,?)) LIMIT 1',(gallery_id,content_hash,encoded_hash,original_hash)).fetchone():
+        raise HTTPException(409,'Photo déjà présente dans cette galerie (doublon).')
 
 
 def process_photo(contents, filename, gallery_id, user, job_id=None):
     # Network reception can continue while this bounded worker does CPU and disk work.
     with analysis_slots:
-        faces = embeddings(contents)
         image = read_image(contents)
         ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 95])
         if not ok:
             raise ValueError('Impossible de lire cette image.')
+        original_hash = hashlib.sha256(contents).hexdigest()
+        content_hash = image_signature(image)
+        encoded_hash = hashlib.sha256(encoded.tobytes()).hexdigest()
+        with connect() as db:
+            gallery_access(db,gallery_id,user,'can_upload',write=True)
+            reject_duplicate(db,gallery_id,content_hash,encoded_hash,original_hash)
+        faces = embeddings(contents)
         photo_id = uuid.uuid4().hex
         with lock, connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -658,6 +681,7 @@ def process_photo(contents, filename, gallery_id, user, job_id=None):
                 job = db.execute('SELECT status FROM photo_jobs WHERE id=?',(job_id,)).fetchone()
                 if job is None or job['status'] != 'processing':
                     raise HTTPException(409,'Import annulé.')
+            reject_duplicate(db,gallery_id,content_hash,encoded_hash,original_hash)
             owner = db.execute('SELECT id,quota_bytes FROM users WHERE id=?', (gallery['owner_id'],)).fetchone()
             if owner and owner['quota_bytes'] is not None and auth.storage_usage(db, owner['id']) + auth.pending_usage(db,owner['id'],job_id) + encoded.nbytes > owner['quota_bytes']:
                 raise HTTPException(413, 'Quota de stockage de la galerie dépassé.')
@@ -666,7 +690,7 @@ def process_photo(contents, filename, gallery_id, user, job_id=None):
             path = directory / (photo_id + '.jpg')
             path.write_bytes(encoded.tobytes())
             try:
-                db.execute('INSERT INTO photos(id,name,faces,gallery_id,bytes,job_id) VALUES (?,?,?,?,?,?)', (photo_id, Path(filename or 'Photo').name, json.dumps(faces), gallery_id, encoded.nbytes, job_id))
+                db.execute('INSERT INTO photos(id,name,faces,gallery_id,bytes,job_id,content_hash,encoded_hash) VALUES (?,?,?,?,?,?,?,?)', (photo_id, Path(filename or 'Photo').name, json.dumps(faces), gallery_id, encoded.nbytes, job_id, content_hash, encoded_hash))
                 db.commit()
             except Exception:
                 path.unlink(missing_ok=True)
@@ -741,13 +765,18 @@ def thumbnail_path(db, gallery_id, photo_id):
 
 def generate_next_thumbnail():
     with connect() as db:
-        photo = db.execute('SELECT * FROM photos WHERE thumbnail_status=0 ORDER BY rowid LIMIT 1').fetchone()
+        photo = db.execute('SELECT * FROM photos WHERE thumbnail_status=0 OR (content_hash IS NULL AND thumbnail_status!=3) ORDER BY rowid LIMIT 1').fetchone()
         if photo is None: return False
         source = storage.gallery_directory(db,PHOTOS,photo['gallery_id']) / (photo['id']+'.jpg')
     try:
-        with Image.open(source) as image:
+        source_bytes = source.read_bytes()
+        if photo['content_hash'] is None:
+            signature = image_signature(read_image(source_bytes))
+            with connect() as db: db.execute('UPDATE photos SET content_hash=? WHERE id=?',(signature,photo['id']))
+            if photo['thumbnail_status'] != 0: return True
+        with Image.open(io.BytesIO(source_bytes)) as image:
             image.thumbnail((480,480)); output = io.BytesIO(); image.convert('RGB').save(output,format='JPEG',quality=80); contents = output.getvalue()
-    except (OSError, UnidentifiedImageError):
+    except (OSError, UnidentifiedImageError, ValueError):
         with connect() as db: db.execute('UPDATE photos SET thumbnail_status=3 WHERE id=?',(photo['id'],))
         return True
     with lock, connect() as db:
@@ -796,7 +825,7 @@ def client_gallery_photos(session=Depends(client_session)):
     if session['mode'] not in ('gallery', 'both'):
         raise HTTPException(403, 'Ce lien permet uniquement une recherche par selfie.')
     with connect() as db:
-        return [dict(row) for row in db.execute('SELECT id,name FROM photos WHERE gallery_id=? ORDER BY rowid DESC', (session['gallery_id'],))]
+        return [dict(row) for row in db.execute('SELECT id,name,(thumbnail_status=1) AS thumbnail_ready FROM photos WHERE gallery_id=? ORDER BY rowid DESC', (session['gallery_id'],))]
 
 
 @app.post('/api/search')
@@ -813,14 +842,14 @@ async def search(file: UploadFile = File(...), session_hash=Depends(client_sessi
         raise HTTPException(400, 'Le selfie doit contenir exactement un visage. Réessayez avec une photo bien éclairée.')
     query = np.array(faces[0])
     with connect() as db:
-        rows = db.execute('SELECT id, name, faces FROM photos WHERE gallery_id=?', (session_hash['gallery_id'],)).fetchall()
+        rows = db.execute('SELECT id, name, faces, thumbnail_status FROM photos WHERE gallery_id=?', (session_hash['gallery_id'],)).fetchall()
     matches = []
     for row in rows:
         vectors = json.loads(row['faces'])
         if vectors:
             score = max(float(np.dot(query, vector)) for vector in vectors)
             if score >= THRESHOLD:
-                matches.append({'id': row['id'], 'name': row['name'], 'score': round(score, 3)})
+                matches.append({'id': row['id'], 'name': row['name'], 'score': round(score, 3), 'thumbnail_ready':row['thumbnail_status']==1})
     with connect() as db:
         db.execute('DELETE FROM client_matches WHERE session_hash=?', (session_hash['token_hash'],))
         db.executemany('INSERT INTO client_matches VALUES (?, ?)', [(session_hash['token_hash'], item['id']) for item in matches])

@@ -33,13 +33,18 @@ class GalleryTests(unittest.TestCase):
         self.b = self.bob.post('/api/galleries', json={'name':'Bob'}).json()['id']
         buffer = io.BytesIO(); Image.new('RGB', (16, 16)).save(buffer, format='PNG'); self.image = buffer.getvalue()
 
+    def make_image(self, color):
+        output=io.BytesIO();Image.new('RGB',(16,16),color).save(output,format='PNG');return output.getvalue()
+
     def login(self, name):
         client = TestClient(app.app)
         self.assertEqual(client.post('/api/login', json={'username':name,'password':'test password'}).status_code, 200)
         return client
 
     def upload(self, client, gallery):
-        response = client.post('/api/photos', params={'gallery_id':gallery}, files={'files':('photo.png',self.image,'image/png')})
+        self.photo_counter=getattr(self,'photo_counter',0)+1
+        image=self.make_image((self.photo_counter*30%256,self.photo_counter*70%256,self.photo_counter*110%256))
+        response = client.post('/api/photos', params={'gallery_id':gallery}, files={'files':('photo.png',image,'image/png')})
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('error', response.json()[0])
         return client.get('/api/photos', params={'gallery_id':gallery}).json()[0]['id']
@@ -255,7 +260,7 @@ class GalleryTests(unittest.TestCase):
             with guard: active -= 1
             return [[1.,0.]]
         async def run():
-            tasks = [asyncio.create_task(app.upload(self.a,[UploadFile(io.BytesIO(self.image),filename=f'{index}.png')],user=user)) for index in range(4)]
+            tasks = [asyncio.create_task(app.upload(self.a,[UploadFile(io.BytesIO(self.make_image((index*25,index*30,index*40))),filename=f'{index}.png')],user=user)) for index in range(4)]
             try:
                 self.assertTrue(await asyncio.to_thread(two_started.wait,3))
                 # The event loop remains usable while both workers wait.
@@ -268,15 +273,77 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(maximum,2)
         self.assertTrue(all('error' not in result[0] for result in results))
         used = self.alice.get('/api/me').json()['used_bytes']
-        self.admin.patch(f"/api/users/{user['id']}",json={'quota_bytes':used + used//4})
+        self.admin.patch(f"/api/users/{user['id']}",json={'quota_bytes':used + 1000})
         self.alice = self.login('alice')
         with app.connect() as db: user = db.execute('SELECT * FROM users WHERE id=?',(user['id'],)).fetchone()
         async def quota_race():
-            return await asyncio.gather(*[app.upload(self.a,[UploadFile(io.BytesIO(self.image),filename='race.png')],user=user) for _ in range(3)])
+            return await asyncio.gather(*[app.upload(self.a,[UploadFile(io.BytesIO(self.make_image((170+index*15,30,200))),filename='race.png')],user=user) for index in range(3)])
         results = asyncio.run(quota_race())
         self.assertEqual(sum('error' not in result[0] for result in results),1)
-        self.assertLessEqual(self.alice.get('/api/me').json()['used_bytes'],used + used//4)
+        self.assertLessEqual(self.alice.get('/api/me').json()['used_bytes'],used + 1000)
 
+
+    def test_duplicate_content_ignores_names_and_png_metadata(self):
+        first = self.alice.post('/api/photos',params={'gallery_id':self.a},files={'files':('original.png',self.image)})
+        self.assertNotIn('error',first.json()[0])
+        from PIL.PngImagePlugin import PngInfo
+        metadata=PngInfo();metadata.add_text('Description','Changed metadata')
+        buffer=io.BytesIO();Image.new('RGB',(16,16)).save(buffer,format='PNG',pnginfo=metadata,compress_level=1)
+        duplicate=self.alice.post('/api/photos',params={'gallery_id':self.a},files={'files':('renamed.png',buffer.getvalue())})
+        self.assertIn('doublon',duplicate.json()[0]['error'])
+        self.assertEqual(len(self.alice.get('/api/photos',params={'gallery_id':self.a}).json()),1)
+        different=self.alice.post('/api/photos',params={'gallery_id':self.a},files={'files':('original.png',self.make_image((220,40,20)))})
+        self.assertNotIn('error',different.json()[0])
+        other_gallery=self.bob.post('/api/photos',params={'gallery_id':self.b},files={'files':('original.png',self.image)})
+        self.assertNotIn('error',other_gallery.json()[0])
+
+    def test_background_duplicate_finishes_as_error(self):
+        import time,jobs
+        self.alice.post('/api/photos',params={'gallery_id':self.a},files={'files':('first.png',self.image)})
+        response=self.alice.post('/api/photo-jobs',params={'gallery_id':self.a},files={'files':('duplicate.png',self.image)})
+        self.assertEqual(response.status_code,202)
+        runner=jobs.ProcessingQueue(app.DB,app.finish_photo_job,app.cleanup_photo_job,lambda:False,2)
+        runner.start()
+        try:
+            for _ in range(100):
+                status=self.alice.get('/api/photo-jobs',params={'gallery_id':self.a}).json()
+                if status['remaining']==0: break
+                time.sleep(.02)
+            else: self.fail('Duplicate job did not finish')
+        finally: runner.stop()
+        self.assertEqual(status['jobs'][0]['status'],'error')
+        self.assertIn('doublon',status['jobs'][0]['error'])
+        self.assertEqual(self.alice.get('/api/me').json()['pending_bytes'],0)
+        self.assertEqual(len(self.alice.get('/api/photos',params={'gallery_id':self.a}).json()),1)
+
+    def test_concurrent_duplicate_cannot_create_two_rows(self):
+        import asyncio,threading
+        from starlette.datastructures import UploadFile
+        with app.connect() as db: user=db.execute("SELECT * FROM users WHERE username='alice'").fetchone()
+        barrier=threading.Barrier(2)
+        def analyze(contents):
+            barrier.wait(timeout=3);return [[1.,0.]]
+        async def run():
+            return await asyncio.gather(*[app.upload(self.a,[UploadFile(io.BytesIO(self.image),filename=f'{index}.png')],user=user) for index in range(2)])
+        with patch.object(app,'embeddings',analyze),patch.object(app,'analysis_slots',threading.BoundedSemaphore(2)):
+            results=asyncio.run(run())
+        self.assertEqual(sum('error' not in result[0] for result in results),1)
+        self.assertEqual(sum('doublon' in result[0].get('error','') for result in results),1)
+        self.assertEqual(len(self.alice.get('/api/photos',params={'gallery_id':self.a}).json()),1)
+
+    def test_existing_file_fingerprint_and_thumbnail_do_not_regenerate(self):
+        photo=self.upload(self.alice,self.a)
+        self.assertTrue(app.generate_next_thumbnail())
+        with app.connect() as db:
+            path=app.thumbnail_path(db,self.a,photo)
+            before=path.stat().st_mtime_ns
+            db.execute('UPDATE photos SET content_hash=NULL WHERE id=?',(photo,))
+        self.assertTrue(app.generate_next_thumbnail())
+        self.assertEqual(path.stat().st_mtime_ns,before)
+        downloaded=self.alice.get(f'/api/photos/{photo}/image').content
+        duplicate=self.alice.post('/api/photos',params={'gallery_id':self.a},files={'files':('downloaded.jpg',downloaded)})
+        self.assertIn('doublon',duplicate.json()[0]['error'])
+        self.assertFalse(app.generate_next_thumbnail())
 
     def test_named_links_can_be_copied_and_deleted_from_list(self):
         created = self.alice.post('/api/client-links',json={'gallery_id':self.a,'name':'Client Dupont','mode':'both'}).json()

@@ -131,3 +131,15 @@ n'est pas considérée comme déployée.
   vérifiées par SHA-256 et 95 miniatures générées sans modification des JPEG principaux.
 - 27 tests automatisés passent. Le déploiement public Portainer et la validation
   visuelle dans un navigateur restent des étapes distinctes.
+
+### Aperçu des couleurs, stabilité des images et doublons
+- [x] Appliquer les couleurs en direct sur la page photographe, sans requête d’écriture.
+- [x] Enregistrer explicitement le thème et conserver l’aperçu pendant le suivi d’import.
+- [x] Conserver les éléments de galerie et de photo pendant les mises à jour de progression.
+- [x] Utiliser directement les miniatures prêtes, sans provoquer un second rechargement.
+- [x] Refuser les doublons dans une même galerie, même renommés ou importés simultanément.
+- [x] Indexer les images existantes sans supprimer les copies déjà présentes et sans
+  régénérer les miniatures existantes.
+- [x] Afficher l’erreur de doublon dans le traitement en arrière-plan.
+- Validation : 34 tests passent, dont aperçu sans sauvegarde, stabilité des miniatures,
+  contenu identique avec métadonnées différentes, concurrence et remontée de l’erreur.
