@@ -8,9 +8,65 @@ function card(photo, download = false) {
   return wrap;
 }
 async function refresh() { const photos = await api('/api/photos'); $('#count').textContent = `${photos.length} photo${photos.length === 1 ? '' : 's'} importée${photos.length === 1 ? '' : 's'}`; $('#library').replaceChildren(...photos.map(p => card(p))); $('#clear').hidden = !photos.length; }
-photoInput?.addEventListener('change', async () => { if (!photoInput.files.length) return; const data = new FormData(); for (const file of photoInput.files) data.append('files', file); photoInput.disabled = true; $('#upload-status').textContent = 'Import et analyse des visages en cours…'; try { const results = await api('/api/photos', {method:'POST', body:data}); const errors = results.filter(r => r.error); const ok = results.filter(r => !r.error); $('#upload-status').textContent = `${ok.length} photo(s) analysée(s), ${ok.reduce((n,r) => n+r.faces,0)} visage(s) détecté(s).` + (errors.length ? ` Erreurs : ${errors.map(e => `${e.name} : ${e.error}`).join(' ; ')}` : ''); await refresh(); } catch(e) { $('#upload-status').textContent = e.message; } finally { photoInput.disabled = false; photoInput.value = ''; } });
+let failedUploads = [], stopUpload = false;
+function uploadOne(file, index, total) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(), data = new FormData();
+    data.append('files', file);
+    xhr.open('POST', '/api/photos');
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) {
+        const percent = Math.round(100 * event.loaded / event.total);
+        $('#upload-progress').value = (index - 1 + event.loaded / event.total) / total * 100;
+        $('#upload-status').textContent = `Photo ${index}/${total} : transfert ${percent} % — ${file.name}`;
+      }
+    };
+    xhr.upload.onload = () => { $('#upload-status').textContent = `Photo ${index}/${total} : analyse des visages…`; };
+    xhr.onerror = () => reject(new Error('Échec du transfert.'));
+    xhr.onload = () => {
+      try {
+        const response = JSON.parse(xhr.responseText);
+        if (xhr.status < 200 || xhr.status >= 300) throw new Error(response.detail || 'Import impossible.');
+        resolve(response[0]);
+      } catch (error) { reject(error); }
+    };
+    xhr.send(data);
+  });
+}
+async function uploadBatch(files) {
+  if (!files.length) return;
+  photoInput.disabled = true; stopUpload = false; failedUploads = [];
+  $('#cancel-upload').hidden = false; $('#retry-upload').hidden = true;
+  $('#upload-progress').hidden = false; $('#upload-progress').value = 0;
+  $('#clear').disabled = true;
+  const results = [];
+  try {
+    for (const [index, file] of files.entries()) {
+      if (stopUpload) { failedUploads.push(...files.slice(index)); break; }
+      let result;
+      try { result = await uploadOne(file, index + 1, files.length); }
+      catch (error) { result = {name:file.name, error:error.message}; }
+      results.push(result);
+      if (result.error) failedUploads.push(file);
+      $('#upload-progress').value = (index + 1) / files.length * 100;
+      await refresh().catch(() => {});
+    }
+    const errors = results.filter(result => result.error), ok = results.filter(result => !result.error);
+    $('#upload-status').textContent = `${ok.length}/${files.length} photo(s) analysée(s), ${ok.reduce((n, result) => n + result.faces, 0)} visage(s) détecté(s).` + (stopUpload ? ' Import arrêté après la photo en cours.' : '') + (errors.length ? ` Erreurs : ${errors.map(error => `${error.name} : ${error.error}`).join(' ; ')}` : '');
+  } catch (error) { $('#upload-status').textContent = error.message; }
+  finally {
+    photoInput.disabled = false; photoInput.value = ''; $('#clear').disabled = false;
+    $('#cancel-upload').hidden = true; $('#retry-upload').hidden = !failedUploads.length;
+  }
+}
+photoInput?.addEventListener('change', () => uploadBatch(Array.from(photoInput.files)));
+$('#cancel-upload')?.addEventListener('click', () => {
+  stopUpload = true;
+  $('#upload-status').textContent = 'Arrêt demandé : la photo en cours sera terminée.';
+});
+$('#retry-upload')?.addEventListener('click', () => uploadBatch([...failedUploads]));
 selfieInput?.addEventListener('change', async () => { if (!selfieInput.files.length) return; const data = new FormData(); data.append('file', selfieInput.files[0]); selfieInput.disabled = true; $('#search-status').textContent = 'Recherche en cours…'; $('#results-section').hidden = true; try { const results = await api('/api/search', {method:'POST', body:data}); $('#search-status').textContent = results.length ? 'Recherche terminée.' : 'Aucune photo correspondante. Essayez un autre selfie bien éclairé.'; $('#results').replaceChildren(...results.map(p => card(p, true))); $('#result-count').textContent = `${results.length} photo${results.length === 1 ? '' : 's'}`; $('#results-section').hidden = false; } catch(e) { $('#search-status').textContent = e.message; } finally { selfieInput.disabled = false; selfieInput.value = ''; } });
-$('#clear')?.addEventListener('click', async () => { if (!confirm('Supprimer toutes les photos et leurs données de reconnaissance ?')) return; try { await api('/api/photos', {method:'DELETE'}); $('#results-section').hidden = true; $('#upload-status').textContent = 'Photos supprimées.'; await refresh(); } catch(e) { $('#upload-status').textContent = e.message; } });
+$('#clear')?.addEventListener('click', async () => { if (!confirm('Supprimer toutes les photos et leurs données de reconnaissance ?')) return; try { await api('/api/photos', {method:'DELETE'}); if ($('#results-section')) $('#results-section').hidden = true; $('#upload-status').textContent = 'Photos supprimées.'; await refresh(); } catch(e) { $('#upload-status').textContent = e.message; } });
 if (photoInput) refresh().catch(e => { $('#upload-status').textContent = e.message; });
 $('#generate-link')?.addEventListener('click', async () => {
   const button = $('#generate-link'); button.disabled = true;

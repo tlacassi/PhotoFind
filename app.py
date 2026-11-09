@@ -19,6 +19,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, RedirectResponse
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('DATA_DIR', ROOT / 'data'))
@@ -224,7 +225,7 @@ async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_
     for file in files:
         try:
             contents = await image_bytes(file)
-            faces = embeddings(contents)
+            faces = await run_in_threadpool(embeddings, contents)
             photo_id = uuid.uuid4().hex
             # Re-encode decoded image to ensure only valid image data is served.
             image = read_image(contents)
@@ -245,7 +246,7 @@ async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_
 @app.post('/api/search')
 async def search(file: UploadFile = File(...), session_hash=Depends(client_session)):
     try:
-        faces = embeddings(await image_bytes(file))
+        faces = await run_in_threadpool(embeddings, await image_bytes(file))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
