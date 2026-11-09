@@ -5,6 +5,8 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - photofind-data:/data
-volumes:
-  photofind-data:
+      - type: bind
+        source: /mnt/data/PhotoFind
+        target: /data
+        bind:
+          create_host_path: false
