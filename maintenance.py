@@ -22,10 +22,21 @@ def validate(directory):
     with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as db:
         if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok' or db.execute('PRAGMA foreign_key_check').fetchone():
             raise ValueError('Base de données invalide.')
-        for (photo_id,) in db.execute('SELECT id FROM photos'):
+        db.row_factory = sqlite3.Row
+        for row in db.execute('SELECT id,gallery_id FROM photos'):
+            photo_id = row['id']
             if len(photo_id) != 32 or any(char not in '0123456789abcdef' for char in photo_id):
                 raise ValueError('Identifiant photo invalide.')
-            if not (directory / 'photos' / (photo_id + '.jpg')).is_file():
+            candidates = [directory / 'photos' / (photo_id + '.jpg')]
+            if 'storage_name' in {column[1] for column in db.execute('PRAGMA table_info(galleries)')}:
+                gallery = db.execute('SELECT storage_name FROM galleries WHERE id=?', (row['gallery_id'],)).fetchone()
+                folder_name = gallery['storage_name'] or row['gallery_id']
+                if folder_name in ('.','..') or Path(folder_name).name != folder_name:
+                    raise ValueError('Dossier de galerie invalide.')
+                candidates.append(directory / 'photos' / folder_name / (photo_id + '.jpg'))
+                if 'storage_name' in {column[1] for column in db.execute('PRAGMA table_info(users)')}:
+                    candidates.append(storage.gallery_directory(db, directory / 'photos', row['gallery_id']) / (photo_id + '.jpg'))
+            if not any(file.is_file() for file in candidates):
                 raise ValueError('Une photo enregistrée manque dans la sauvegarde.')
 
 

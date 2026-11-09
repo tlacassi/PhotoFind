@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from PIL import Image
+import support
 import app
 import auth
 import storage
@@ -23,7 +24,7 @@ class GalleryTests(unittest.TestCase):
         storage.initialize(database)
         for name, role in [('admin', 'admin'), ('alice', 'photographer'), ('bob', 'photographer')]:
             auth.create_user(database, name, 'test password', role)
-        for obj, key, value in [(app, 'DB', database), (app, 'PHOTOS', root), (app.app.state, 'db_path', database)]:
+        for obj, key, value in [(app, 'DB', database), (app, 'PHOTOS', root / 'photos'), (app.app.state, 'db_path', database)]:
             patcher = patch.object(obj, key, value); patcher.start(); self.addCleanup(patcher.stop)
         patcher = patch.object(app, 'embeddings', return_value=[[1., 0.]])
         patcher.start(); self.addCleanup(patcher.stop)
@@ -145,7 +146,159 @@ class GalleryTests(unittest.TestCase):
             self.assertIn('SameSite=strict', response.headers['set-cookie'])
 
 
+    def test_multiple_links_modes_and_gallery_path(self):
+        photo = self.upload(self.alice, self.a)
+        foreign = self.upload(self.bob, self.b)
+        links = []
+        for mode, days in [('gallery',1),('search',7),('both',30)]:
+            response = self.alice.post('/api/client-links', json={'gallery_id':self.a,'days':days,'mode':mode})
+            self.assertEqual(response.status_code,200)
+            link = response.json(); links.append(link)
+            self.assertEqual(link['path'], '/client/' + self.a)
+            client = TestClient(app.app)
+            self.assertEqual(client.post('/api/client/redeem',json={'token':link['token'],'gallery_id':self.b}).status_code,401)
+            session = client.post('/api/client/redeem',json={'token':link['token'],'gallery_id':self.a})
+            self.assertEqual(session.json()['mode'],mode)
+            self.assertEqual(client.get('/api/client/photos',params={'gallery_id':self.a}).status_code,403 if mode=='search' else 200)
+            self.assertEqual(client.get(f'/api/client/photos/{photo}/image',params={'gallery_id':self.a}).status_code,404 if mode=='search' else 200)
+            self.assertEqual(client.get('/api/client/session',params={'gallery_id':self.b}).status_code,401)
+            self.assertEqual(client.get(f'/api/client/photos/{foreign}/image',params={'gallery_id':self.a}).status_code,404)
+            result = client.post('/api/search',params={'gallery_id':self.a},files={'file':('selfie.png',self.image)})
+            self.assertEqual(result.status_code,403 if mode=='gallery' else 200)
+            self.assertEqual(client.get(f'/api/client/photos/{photo}/image',params={'gallery_id':self.a}).status_code,200)
+        listed = self.alice.get('/api/client-links',params={'gallery_id':self.a}).json()
+        self.assertEqual(len(listed),3)
+        self.assertEqual(len({link['token'] for link in links}),3)
+        self.alice.delete('/api/client-links/' + app.digest(links[0]['token']))
+        self.assertEqual(TestClient(app.app).post('/api/client/redeem',json={'token':links[1]['token']}).status_code,200)
+        with patch.object(app.qrcode,'make',wraps=app.qrcode.make) as qr:
+            response = self.alice.post('/api/client-qr',json={'token':links[2]['token']},headers={'Origin':'http://testserver'})
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(qr.call_args.args[0], 'http://testserver/client/' + self.a + '#' + links[2]['token'])
+
+    def test_user_gallery_folders_are_unique_and_delete_is_complete(self):
+        first = self.alice.post('/api/galleries',json={'name':'Événement / test'}).json()
+        second = self.alice.post('/api/galleries',json={'name':'Événement / test'}).json()
+        self.assertRegex(first['storage_name'], r'^\d{4}-\d{2}-\d{2}-evenement-test$')
+        self.assertEqual(second['storage_name'],first['storage_name']+'-1')
+        with app.connect() as db:
+            user_root = storage.user_directory(db,app.PHOTOS,first['owner_id'])
+            (user_root / (first['storage_name']+'-2')).mkdir()
+        third = self.alice.post('/api/galleries',json={'name':'Événement / test'}).json()
+        self.assertEqual(third['storage_name'],first['storage_name']+'-3')
+        photo = self.upload(self.alice, first['id'])
+        foreign = self.upload(self.bob,self.b)
+        with app.connect() as db:
+            folder = storage.gallery_directory(db,app.PHOTOS,first['id'])
+            self.assertTrue((folder / (photo+'.jpg')).is_file())
+            self.assertEqual(folder.parent,user_root)
+        client, _ = self.client_for(self.alice,first['id'])
+        client.post('/api/search',files={'file':('selfie.png',self.image)})
+        self.assertEqual(self.bob.delete('/api/galleries/'+first['id']).status_code,404)
+        response = self.alice.delete('/api/galleries/'+first['id'])
+        self.assertEqual(response.json(), {'deleted':True,'photos_deleted':1,'cleanup_pending':False})
+        self.assertFalse(folder.exists())
+        self.assertEqual(client.get('/api/client/session').status_code,401)
+        self.assertEqual(self.bob.get(f'/api/photos/{foreign}/image').status_code,200)
+        with app.connect() as db:
+            self.assertFalse(db.execute('SELECT 1 FROM photos WHERE id=?',(photo,)).fetchone())
+            self.assertFalse(db.execute('SELECT 1 FROM client_links WHERE gallery_id=?',(first['id'],)).fetchone())
+            self.assertFalse(db.execute('SELECT 1 FROM client_matches WHERE photo_id=?',(photo,)).fetchone())
+
+    def test_invitation_registration_usage_and_quota(self):
+        self.assertEqual(self.alice.post('/api/invitations',json={}).status_code,403)
+        invitation = self.admin.post('/api/invitations',json={'days':3,'quota_bytes':10000}).json()
+        visitor = TestClient(app.app)
+        self.assertEqual(visitor.post('/api/register',json={'token':'invalid invitation token','username':'newbie','password':'test password'}).status_code,400)
+        registration = {'token':invitation['token'],'username':'newbie','password':'test password','role':'admin','quota_bytes':999999999}
+        self.assertEqual(visitor.post('/api/register',json=registration).status_code,201)
+        self.assertEqual(visitor.post('/api/register',json={**registration,'username':'another'}).status_code,400)
+        newbie = self.login('newbie')
+        user = newbie.get('/api/me').json()
+        self.assertEqual(user['role'],'photographer')
+        self.assertEqual(user['quota_bytes'],10000)
+        self.assertEqual(user['used_bytes'],0)
+        self.assertEqual(newbie.get('/api/galleries').json(),[])
+        with app.connect() as db:
+            self.assertTrue(storage.user_directory(db,app.PHOTOS,user['id']).is_dir())
+        gallery = newbie.post('/api/galleries',json={'name':'Own'}).json()['id']
+        photo = self.upload(newbie,gallery)
+        usage = newbie.get('/api/me').json()['used_bytes']
+        self.assertGreater(usage,0)
+        self.assertEqual(self.admin.patch(f"/api/users/{user['id']}",json={'quota_bytes':usage}).status_code,200)
+        newbie = self.login('newbie')
+        response = newbie.post('/api/photos',params={'gallery_id':gallery},files={'files':('more.png',self.image)})
+        self.assertIn('Quota',response.json()[0]['error'])
+        self.assertEqual(len(newbie.get('/api/photos',params={'gallery_id':gallery}).json()),1)
+        newbie.delete(f'/api/photos/{photo}')
+        self.assertEqual(newbie.get('/api/me').json()['used_bytes'],0)
+        self.admin.patch(f"/api/users/{user['id']}",json={'quota_bytes':None})
+        self.assertIsNone(self.login('newbie').get('/api/me').json()['quota_bytes'])
+        self.assertTrue(self.admin.get('/api/invitations').json()[0]['used'])
+        revoked = self.admin.post('/api/invitations',json={}).json()
+        self.admin.delete('/api/invitations/'+app.digest(revoked['token']))
+        self.assertEqual(visitor.post('/api/invitations/check',json={'token':revoked['token']}).status_code,400)
+
+    def test_analysis_is_parallel_bounded_and_quota_is_atomic(self):
+        import asyncio
+        import threading
+        from starlette.datastructures import UploadFile
+        with app.connect() as db:
+            user = db.execute("SELECT * FROM users WHERE username='alice'").fetchone()
+        active = 0; maximum = 0; guard = threading.Lock(); two_started = threading.Event(); release = threading.Event()
+        def analyze(contents):
+            nonlocal active, maximum
+            with guard:
+                active += 1; maximum = max(maximum,active)
+                if active == 2: two_started.set()
+            if not release.wait(5): raise RuntimeError('Timed out waiting for concurrent analysis')
+            with guard: active -= 1
+            return [[1.,0.]]
+        async def run():
+            tasks = [asyncio.create_task(app.upload(self.a,[UploadFile(io.BytesIO(self.image),filename=f'{index}.png')],user=user)) for index in range(4)]
+            try:
+                self.assertTrue(await asyncio.to_thread(two_started.wait,3))
+                # The event loop remains usable while both workers wait.
+                self.assertFalse(any(task.done() for task in tasks))
+            finally:
+                release.set()
+            return await asyncio.gather(*tasks)
+        with patch.object(app,'analysis_slots',threading.BoundedSemaphore(2)), patch.object(app,'embeddings',analyze):
+            results = asyncio.run(run())
+        self.assertEqual(maximum,2)
+        self.assertTrue(all('error' not in result[0] for result in results))
+        used = self.alice.get('/api/me').json()['used_bytes']
+        self.admin.patch(f"/api/users/{user['id']}",json={'quota_bytes':used + used//4})
+        self.alice = self.login('alice')
+        with app.connect() as db: user = db.execute('SELECT * FROM users WHERE id=?',(user['id'],)).fetchone()
+        async def quota_race():
+            return await asyncio.gather(*[app.upload(self.a,[UploadFile(io.BytesIO(self.image),filename='race.png')],user=user) for _ in range(3)])
+        results = asyncio.run(quota_race())
+        self.assertEqual(sum('error' not in result[0] for result in results),1)
+        self.assertLessEqual(self.alice.get('/api/me').json()['used_bytes'],used + used//4)
+
+
 class MigrationTests(unittest.TestCase):
+    def test_existing_photo_files_migrate_into_user_and_gallery_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); photos = root / 'photos'; photos.mkdir()
+            path = root / 'photos.db'
+            auth.initialize(path); auth.create_user(path,'admin','test password','admin')
+            photo_id = 'b' * 32
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE photos (id TEXT PRIMARY KEY,name TEXT,faces TEXT)')
+                db.execute('INSERT INTO photos VALUES (?,?,?)',(photo_id,'Saved','[]'))
+            (photos / (photo_id+'.jpg')).write_bytes(b'original-image')
+            storage.initialize(path); storage.organize_photos(path,photos)
+            storage.initialize(path); storage.organize_photos(path,photos)
+            with storage.connect(path) as db:
+                folder = storage.gallery_directory(db,photos,'legacy')
+                self.assertTrue(folder.parent.name.startswith('user-1-'))
+                self.assertEqual((folder / (photo_id+'.jpg')).read_bytes(),b'original-image')
+                self.assertEqual(db.execute('SELECT bytes FROM photos').fetchone()[0],14)
+            self.assertFalse((photos / (photo_id+'.jpg')).exists())
+            self.assertEqual(len(list(photos.rglob(photo_id+'.jpg'))),1)
+
     def test_legacy_photo_and_link_migrate_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'photos.db'

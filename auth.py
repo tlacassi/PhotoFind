@@ -25,6 +25,10 @@ def initialize(path: Path):
         for name in ('active', 'can_create_galleries', 'can_upload', 'can_delete', 'can_share'):
             if name not in columns:
                 db.execute(f'ALTER TABLE users ADD COLUMN {name} INTEGER NOT NULL DEFAULT 1')
+        for name, definition in [('storage_name', 'TEXT'), ('quota_bytes', 'INTEGER')]:
+            if name not in columns:
+                db.execute(f'ALTER TABLE users ADD COLUMN {name} {definition}')
+        db.execute('CREATE TABLE IF NOT EXISTS invitations (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, quota_bytes INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0)')
         db.execute('CREATE TABLE IF NOT EXISTS login_attempts (username TEXT PRIMARY KEY COLLATE NOCASE, failures INTEGER NOT NULL, until INTEGER NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL)')
 
@@ -48,14 +52,16 @@ def validate_credentials(username: str, password: str):
         raise ValueError('Le mot de passe doit contenir entre 8 et 256 caractères.')
 
 
-def create_user(path: Path, username: str, password: str, role: str, initial=False):
+def create_user(path: Path, username: str, password: str, role: str, initial=False, quota_bytes=None):
     validate_credentials(username, password)
     hashed = hash_password(password)
     with connect(path) as db:
         db.execute('BEGIN IMMEDIATE')
         if initial and db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
             raise ValueError('Un compte existe déjà.')
-        db.execute('INSERT INTO users(username, password_hash, role) VALUES (?, ?, ?)', (username, hashed, role))
+        cursor = db.execute('INSERT INTO users(username, password_hash, role, quota_bytes) VALUES (?, ?, ?, ?)', (username, hashed, role, quota_bytes))
+        initialize_user_directory(db, path.parent / 'photos', cursor.lastrowid, username)
+        return cursor.lastrowid
 
 
 def authenticate(path: Path, username: str, password: str):
@@ -95,7 +101,7 @@ def admin_user(request: Request):
 
 
 def public_user(user):
-    return {key: user[key] for key in ('id', 'username', 'role', 'active', 'can_create_galleries', 'can_upload', 'can_delete', 'can_share')}
+    return {key: user[key] for key in ('id', 'username', 'role', 'active', 'can_create_galleries', 'can_upload', 'can_delete', 'can_share', 'quota_bytes')}
 
 
 def require_permission(user, permission):
@@ -117,3 +123,16 @@ def login_allowed(path, username):
 def clear_attempts(path, username):
     with connect(path) as db:
         db.execute('DELETE FROM login_attempts WHERE username=?', (username,))
+
+
+
+def initialize_user_directory(db, root, user_id, username):
+    import re
+    slug = re.sub(r'[^a-z0-9]+', '-', username.lower()).strip('-')[:40] or 'photographe'
+    name = f'user-{user_id}-{slug}'
+    (root / name).mkdir(parents=True, exist_ok=True)
+    db.execute('UPDATE users SET storage_name=? WHERE id=?', (name, user_id))
+
+
+def storage_usage(db, user_id):
+    return db.execute('SELECT COALESCE(SUM(p.bytes),0) FROM photos p JOIN galleries g ON g.id=p.gallery_id WHERE g.owner_id=?', (user_id,)).fetchone()[0]

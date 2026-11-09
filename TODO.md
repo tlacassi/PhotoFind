@@ -4,16 +4,16 @@ Les cases sont cochées après implémentation et vérification. Une modificatio
 n'est pas considérée comme déployée.
 
 ## 1. Imports fiables et progression
-- [x] Transférer les photos une par une et distinguer transfert / analyse.
+- [x] Transférer chaque photo dans sa requête et distinguer transfert / analyse.
 - [x] Afficher la progression et les erreurs par photo.
-- [x] Permettre l'arrêt après la photo en cours et réessayer uniquement les échecs.
+- [x] Permettre l'arrêt après les photos en cours et réessayer uniquement les échecs.
 - [x] Exécuter l’analyse dans un thread, hors de la boucle des requêtes (test automatisé).
 - [x] Vérifier la persistance d’un import réel OpenCV après redémarrage (test HTTP).
 - [ ] Vérifier visuellement l’import, les galeries et l’administration dans le navigateur.
 - [x] Examiner l'expérience Erugo avant d'affiner l'interface.
 
 ## 2. Galeries et migration
-- [x] Créer, renommer et archiver des galeries.
+- [x] Créer, renommer et désactiver des galeries.
 - [x] Rattacher chaque photo à une galerie et conserver les données existantes.
 - [x] Limiter chaque recherche client à la galerie du lien.
 - [x] Tester une migration depuis l'ancien schéma et son redémarrage.
@@ -93,3 +93,20 @@ n'est pas considérée comme déployée.
 - [x] Sauvegarder les données locales et redémarrer le serveur local sans rechargement
   automatique qui tournait depuis avant l’ajout des galeries.
 - La validation visuelle reste en attente ; création et miniature sont testées par API.
+
+### Imports parallèles, stockage et invitations
+- [x] Trois requêtes d’import simultanées et deux analyses en parallèle, bornées côté serveur.
+- [x] Progression globale et détail par fichier ; arrêt/reprise avec requêtes en cours.
+- [x] Vérifier les actions renommer, désactiver/réactiver et miniature automatique (API et DOM simulé).
+- [x] Supprimer une galerie et toutes ses photos/liens avec confirmation distincte.
+- [x] Plusieurs liens simultanés, dates indépendantes et URL explicite de galerie.
+- [x] Modes galerie, selfie ou mixte, contrôlés côté serveur.
+- [x] Dossier par utilisateur, galeries datées et suffixes uniques, migration sans écrasement.
+- [x] Invitations administrateur à usage unique avec durée et quota, inscription autonome.
+- [x] Quotas modifiables, consommation visible côté admin et photographe, contrôle atomique à l’import.
+- [x] Migration et conservation des images existantes vérifiées sur une bibliothèque isolée.
+- Validation : 21 tests passent, dont concurrence, quotas, invitations, stockage, modes et suppression.
+- Validation visuelle navigateur toujours en attente (accès précédemment refusé par l’outil).
+
+- Migration locale appliquée après sauvegarde : 95 images préexistantes conservées,
+  contrôlées par SHA-256 ; serveur local redémarré avec le nouveau code.

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from PIL import Image
 from starlette.datastructures import UploadFile
+import support
 import app
 import auth
 import storage
@@ -33,13 +34,13 @@ class UploadTests(unittest.TestCase):
             def analyze(contents):
                 workers.append(threading.get_ident())
                 return []
-            with patch.object(app, 'DB', database), patch.object(app, 'PHOTOS', root), patch.object(app, 'embeddings', analyze):
+            with patch.object(app, 'DB', database), patch.object(app, 'PHOTOS', root / 'photos'), patch.object(app, 'embeddings', analyze):
                 result = asyncio.run(app.upload('test', [UploadFile(io.BytesIO(buffer.getvalue()), filename='sample.png')], user=user))
                 self.assertEqual(result, [{'name': 'sample.png', 'faces': 0}])
                 self.assertNotEqual(workers, [main_thread])
                 with sqlite3.connect(database) as db:
                     row = db.execute('SELECT id, name, faces FROM photos').fetchone()
-                self.assertTrue((root / (row[0] + '.jpg')).is_file())
+                self.assertTrue((root / 'photos' / 'user-1-admin' / 'test' / (row[0] + '.jpg')).is_file())
                 self.assertEqual(json.loads(row[2]), [])
 
     def test_invalid_photo_does_not_prevent_next_upload(self):

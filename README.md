@@ -8,27 +8,46 @@ pas envoyées à un service de reconnaissance externe.
 ## Fonctionnement
 
 - **Galeries** : bouton de création ouvrant la saisie du nom, liste de galeries
-  avec miniature, renommage et archivage. La miniature utilise la dernière photo
-  importée par défaut ; le bouton étoile d’une photo permet de la choisir. Une galerie appartient à un
+  avec miniature, renommage, désactivation et suppression définitive. La miniature utilise la
+  dernière photo importée par défaut ; le bouton étoile permet de la choisir. Une galerie appartient à un
   compte ; son propriétaire peut autoriser explicitement d'autres photographes.
   L'administrateur voit toutes les galeries.
-- **Import** : photos envoyées une par une, progression du transfert puis état
-  d'analyse, résultat par photo, arrêt après la photo en cours et nouvelle tentative
-  des photos en erreur ou non envoyées. L'analyse est exécutée dans un thread.
+- **Import** : trois requêtes simultanées permettent de poursuivre les envois pendant
+  les analyses. Deux analyses au maximum par processus (`ANALYSIS_WORKERS`, défaut 2),
+  avec un thread OpenCV par traitement (`OPENCV_THREADS`, défaut 1). Décodage, analyse
+  et écriture sont exécutés hors de la boucle des requêtes. Progression globale
+  du transfert et détail par photo ; l’arrêt termine les photos déjà en cours,
+  puis la reprise renvoie les éléments restants.
 - **Clients sans compte** : lien privé et QR code associés à une galerie, validité
-  de 1 à 90 jours. Le token du lien est retiré de la barre d'adresse après échange
-  contre un cookie HttpOnly. Une session dure au maximum 8 heures. Les images
+  de 1 à 90 jours, plusieurs liens simultanés avec des expirations indépendantes.
+  Modes : galerie seule, selfie seul ou les deux. Le serveur contrôle les modes.
+  L’adresse contient la galerie (`/client/<id>#<token>`), et le token du lien est retiré de la barre d'adresse après échange
+  contre un cookie HttpOnly. Une session dure au maximum 8 heures. En mode selfie seul, les images
   téléchargeables sont limitées aux résultats de la recherche de cette session.
+  En mode galerie ou mixte, toutes les images de cette galerie sont consultables.
 - **Liens** : liste des dates d'expiration et révocation immédiate des accès liés.
-  L'archivage révoque les liens, et les restaurer ne réactive pas les anciens liens.
+  La désactivation révoque les liens ; réactiver la galerie ne les réactive pas.
+  La suppression efface sa galerie, ses photos et ses liens après confirmation,
+  y compris lorsque la galerie est désactivée.
 - **Administration `/admin`** : création, liste, modification, désactivation et
   réinitialisation du mot de passe des comptes ; déconnexion de leurs sessions.
   Permissions : gestion de ses galeries, import, suppression de photos, partage.
   Les administrateurs ont tous les droits. Votre propre compte administrateur ne
   peut être désactivé ou rétrogradé depuis cette interface.
+- **Invitations** : l’administrateur génère un lien à usage unique, valable 1 à 30
+  jours, et choisit le quota du futur photographe. Le destinataire définit son
+  identifiant et son mot de passe ; il obtient son compte personnel sans accès
+  automatique aux galeries existantes. Les invitations sont listables et révocables.
+- **Quotas** : quota des photos modifiable par l’administrateur, consommation visible
+  des deux côtés. Valeur vide = illimité dans la gestion des comptes, 0 = aucun
+  nouvel import. L’usage correspond aux JPEG stockés, pas aux octets transférés.
+  Les imports concurrents réservent leur place dans une transaction SQLite pour
+  éviter de dépasser le quota. Un import dans une galerie partagée compte pour
+  son propriétaire. Les comptes existants restent illimités jusqu’à modification ;
+  la création et les invitations proposent 5 Gio par défaut.
 - **Accès partagés** : les collaborateurs utilisent leurs permissions de compte
   dans une galerie autorisée, mais seul le propriétaire ou l'administrateur peut
-  renommer/archiver la galerie et gérer ses collaborateurs. Retirer un collaborateur
+  renommer/désactiver/supprimer la galerie et gérer ses collaborateurs. Retirer un collaborateur
   révoque tous les liens de la galerie, car il pourrait les avoir conservés.
 
 Les changements de compte révoquent ses sessions. Désactiver un propriétaire
@@ -71,6 +90,14 @@ accessible en lecture/écriture à l'UID 10001 du conteneur. La base `photos.db`
 photos réencodées et les empreintes y résident, hors du dépôt et de l'image.
 La bibliothèque locale du Mac est distincte de celle du serveur.
 
+Les fichiers sont rangés dans `photos/user-<id>-<identifiant>/<date>-<nom-galerie>/`.
+La date utilise UTC. Un nom déjà pris reçoit `-1`, `-2`, etc., sans réutiliser de
+dossier existant, y compris hors base. Les identifiants de galerie et les liens
+sont indépendants de ces noms. Renommer un compte ou une galerie ne renomme pas
+son dossier : les chemins restent stables. SQLite reste une base commune, avec
+les associations et les empreintes, et non un fichier de base par utilisateur.
+
+
 Le service écoute sur `127.0.0.1:18080` du serveur. La route du tunnel Cloudflare
 existant cible `http://127.0.0.1:18080` depuis le même hôte. Le Compose serveur
 force les cookies `Secure` ; utilisez l'adresse HTTPS publique pour vous connecter.
@@ -82,11 +109,11 @@ le code ; aucun registre d'images n'est nécessaire. Sauvegardez avant mise à j
 
 ### Migration des anciennes bibliothèques
 
-Au démarrage, une migration additive ajoute les galeries et les permissions.
+Au démarrage, une migration additive ajoute les galeries, permissions, modes de liens et quotas.
 Les anciennes photos et anciens liens sont rattachés à « Photos existantes »,
 possédée par le premier administrateur. S'il n'existe pas encore d'administrateur,
-cette galerie n'est visible que des administrateurs futurs. Aucune image ni
-empreinte existante n'est supprimée ou recalculée. Les autres photographes n'ont
+cette galerie n'est visible que des administrateurs futurs. Aucune empreinte existante n’est supprimée ou recalculée. Les images existantes
+sont déplacées dans les dossiers utilisateur/galerie sans réencodage et sans écrasement. Les autres photographes n'ont
 plus accès automatiquement à cette bibliothèque : accordez-leur un accès explicite.
 La migration peut être relancée au redémarrage sans dupliquer les données.
 
@@ -124,8 +151,8 @@ python -m unittest discover -s tests -v
 ```
 
 Tests : migration répétée, deux photographes et deux clients isolés, collaboration,
-permissions, comptes, archivage, révocation, limitation des connexions, cookies,
-import, progression/arrêt/reprise avec faux transport JavaScript, sauvegarde et
+permissions, comptes, désactivation, suppression, invitations, quotas concurrents, révocation, limitation des connexions, cookies,
+import parallèle, migration physique, progression/arrêt/reprise avec faux transport JavaScript, sauvegarde et
 restauration. Le test réel d'import et redémarrage nécessite les modèles téléchargés.
 Les tests de recherche utilisent des embeddings déterministes ; ils vérifient
 l'isolation, pas la précision biométrique. Les tests JavaScript utilisent QuickJS
@@ -148,8 +175,10 @@ et un DOM simulé : une validation visuelle dans un navigateur reste nécessaire
   Pas de MFA ni de récupération par email ; réinitialisation via un administrateur.
 - Les partages entre photographes sont des accès à la galerie avec leurs permissions
   globales, pas des rôles différents pour chaque galerie.
-- Pas de paiement, de galerie publique, de ZIP, de suppression de galerie complète,
-  de quota de stockage ou de sauvegarde programmée pour le moment.
+- Pas de paiement, de galerie publique sans lien privé, de ZIP ou de sauvegarde
+  programmée. Si un problème disque empêche l’effacement après suppression d’une
+  galerie, l’interface et les journaux signalent le dossier `.deleted-*` à nettoyer ;
+  ce reliquat n’est plus accessible par les liens et n’est plus compté dans le quota.
 
 Voir [TODO.md](TODO.md) pour l'avancement et les validations restantes.
 Les modèles et leurs licences sont référencés dans [OpenCV Zoo](https://github.com/opencv/opencv_zoo).
