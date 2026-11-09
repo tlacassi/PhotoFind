@@ -11,7 +11,7 @@ data.mkdir(parents=True, exist_ok=True)
 db = data / 'photos.db'
 auth.initialize(db)
 username = input('Identifiant administrateur : ').strip()
-password = getpass.getpass('Mot de passe (12 caractères minimum) : ')
+password = getpass.getpass('Mot de passe (8 caractères minimum) : ')
 if password != getpass.getpass('Confirmez le mot de passe : '):
     raise SystemExit('Les mots de passe ne correspondent pas.')
 try:

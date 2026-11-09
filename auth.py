@@ -39,8 +39,8 @@ def verify_password(password: str, stored: str) -> bool:
 def validate_credentials(username: str, password: str):
     if not 3 <= len(username) <= 64 or not all(c.isascii() and (c.isalnum() or c in '._-') for c in username):
         raise ValueError('Identifiant invalide : 3 à 64 lettres, chiffres, points, tirets ou underscores.')
-    if not 12 <= len(password) <= 256:
-        raise ValueError('Le mot de passe doit contenir entre 12 et 256 caractères.')
+    if not 8 <= len(password) <= 256:
+        raise ValueError('Le mot de passe doit contenir entre 8 et 256 caractères.')
 
 
 def create_user(path: Path, username: str, password: str, role: str, initial=False):
