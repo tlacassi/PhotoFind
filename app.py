@@ -9,13 +9,14 @@ import hashlib
 import time
 
 import auth
+import storage
 from pathlib import Path
 
 import cv2
 import numpy as np
 import qrcode
 from PIL import Image, ImageOps, UnidentifiedImageError
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse, Response, RedirectResponse
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +28,7 @@ MODELS = Path(os.environ.get('MODEL_DIR', ROOT / 'models'))
 PHOTOS = DATA / 'photos'
 PHOTOS.mkdir(parents=True, exist_ok=True)
 DB = DATA / 'photos.db'
+_application_lock = storage.application_lock(DATA)
 THRESHOLD = float(os.environ.get('MATCH_THRESHOLD', '0.363'))
 MAX_BYTES = 20 * 1024 * 1024
 lock = threading.Lock()
@@ -37,16 +39,10 @@ app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 
 
 def connect():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
-    return db
+    return storage.connect(DB)
 
 
-with connect() as db:
-    db.execute('CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, name TEXT NOT NULL, faces TEXT NOT NULL)')
-    db.execute('CREATE TABLE IF NOT EXISTS client_links (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL)')
-    db.execute('CREATE TABLE IF NOT EXISTS client_sessions (token_hash TEXT PRIMARY KEY, link_hash TEXT NOT NULL, expires INTEGER NOT NULL)')
-    db.execute('CREATE TABLE IF NOT EXISTS client_matches (session_hash TEXT NOT NULL, photo_id TEXT NOT NULL, PRIMARY KEY(session_hash, photo_id))')
+storage.initialize(DB)
 
 
 def read_image(contents):
@@ -113,12 +109,14 @@ def login_page():
 
 @app.post('/api/login')
 def login(credentials: Credentials, request: Request, response: Response):
+    auth.login_allowed(DB, credentials.username)
     user = auth.authenticate(DB, credentials.username, credentials.password)
     if not user:
         raise HTTPException(401, 'Identifiant ou mot de passe incorrect.')
+    auth.clear_attempts(DB, credentials.username)
     token = auth.new_session(DB, user['id'])
-    response.set_cookie(auth.COOKIE, token, httponly=True, samesite='strict', secure=request.url.scheme == 'https', max_age=auth.SESSION_SECONDS, path='/')
-    return {'username': user['username'], 'role': user['role']}
+    response.set_cookie(auth.COOKIE, token, httponly=True, samesite='strict', secure=os.environ.get('SECURE_COOKIES', '').lower() == 'true' or request.url.scheme == 'https', max_age=auth.SESSION_SECONDS, path='/')
+    return auth.public_user(user)
 
 
 @app.post('/api/logout')
@@ -133,19 +131,210 @@ def logout(request: Request, response: Response, user=Depends(auth.current_user)
 
 @app.get('/api/me')
 def me(user=Depends(auth.current_user)):
-    return {'username': user['username'], 'role': user['role']}
+    return auth.public_user(user)
+
+
+
+
+class AccountCreate(Credentials):
+    role: str = 'photographer'
+
+
+class AccountUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=64)
+    role: str | None = None
+    active: bool | None = None
+    can_create_galleries: bool | None = None
+    can_upload: bool | None = None
+    can_delete: bool | None = None
+    can_share: bool | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+
+
+@app.get('/admin')
+def admin_page(request: Request):
+    auth.admin_user(request)
+    return FileResponse(ROOT / 'static' / 'admin.html', headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/users')
+def users(user=Depends(auth.admin_user)):
+    with connect() as db:
+        return [auth.public_user(row) for row in db.execute('SELECT * FROM users ORDER BY username')]
 
 
 @app.post('/api/users', status_code=201)
-def create_photographer(credentials: Credentials, user=Depends(auth.admin_user)):
+def create_account(payload: AccountCreate, user=Depends(auth.admin_user)):
+    if payload.role not in ('admin', 'photographer'):
+        raise HTTPException(400, 'Rôle invalide.')
     try:
-        auth.create_user(DB, credentials.username, credentials.password, 'photographer')
+        auth.create_user(DB, payload.username, payload.password, payload.role)
     except ValueError as error:
         raise HTTPException(400, str(error))
     except sqlite3.IntegrityError:
         raise HTTPException(409, 'Cet identifiant existe déjà.')
-    return {'username': credentials.username, 'role': 'photographer'}
+    return {'username': payload.username, 'role': payload.role}
 
+
+@app.patch('/api/users/{user_id}')
+def update_account(user_id: int, payload: AccountUpdate, user=Depends(auth.admin_user)):
+    values = payload.model_dump(exclude_none=True)
+    if 'role' in values and values['role'] not in ('admin', 'photographer'):
+        raise HTTPException(400, 'Rôle invalide.')
+    try:
+        if 'username' in values:
+            auth.validate_credentials(values['username'], 'validation-only')
+        if 'password' in values:
+            values['password_hash'] = auth.hash_password(values.pop('password'))
+        with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            target = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            if target is None:
+                raise HTTPException(404, 'Compte introuvable.')
+            disabling = values.get('active') is False or values.get('role') == 'photographer'
+            if disabling and target['role'] == 'admin':
+                count = db.execute("SELECT count(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+                if user_id == user['id'] or (target['active'] and count <= 1):
+                    raise HTTPException(400, 'Conservez votre compte administrateur actif.')
+            if values:
+                assignments = ','.join(f'{key}=?' for key in values)
+                db.execute(f'UPDATE users SET {assignments} WHERE id=?', (*values.values(), user_id))
+                db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+                if values.get('active') is False:
+                    db.execute('UPDATE client_links SET expires=0 WHERE gallery_id IN (SELECT id FROM galleries WHERE owner_id=?)', (user_id,))
+            return auth.public_user(db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone())
+    except ValueError as error:
+        raise HTTPException(400, str(error))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, 'Cet identifiant existe déjà.')
+
+
+@app.delete('/api/users/{user_id}/sessions')
+def revoke_sessions(user_id: int, user=Depends(auth.admin_user)):
+    with connect() as db:
+        db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+    return {'ok': True}
+
+
+class GalleryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class GalleryUpdate(BaseModel):
+    cover_photo_id: str | None = Field(default=None, max_length=32)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    archived: bool | None = None
+
+
+def gallery_access(db, gallery_id, user, permission=None, write=False, owner=False):
+    current = db.execute('SELECT * FROM users WHERE id=? AND active=1', (user['id'],)).fetchone()
+    if current is None:
+        raise HTTPException(401, 'Connexion requise.')
+    user = current
+    gallery = db.execute('SELECT * FROM galleries WHERE id=?', (gallery_id,)).fetchone()
+    if gallery is None:
+        raise HTTPException(404, 'Galerie introuvable.')
+    if user['role'] != 'admin' and gallery['owner_id'] != user['id']:
+        if owner or not db.execute('SELECT 1 FROM gallery_members WHERE gallery_id=? AND user_id=?', (gallery_id, user['id'])).fetchone():
+            raise HTTPException(404, 'Galerie introuvable.')
+    if permission:
+        auth.require_permission(user, permission)
+    if write and gallery['archived']:
+        raise HTTPException(409, 'Cette galerie est archivée.')
+    return gallery
+
+
+@app.get('/api/galleries')
+def galleries(user=Depends(auth.current_user)):
+    with connect() as db:
+        rows = db.execute('SELECT g.*, (SELECT count(*) FROM photos WHERE gallery_id=g.id) AS photo_count, COALESCE((SELECT p.id FROM photos p WHERE p.id=g.cover_photo_id AND p.gallery_id=g.id), (SELECT p.id FROM photos p WHERE p.gallery_id=g.id ORDER BY p.rowid DESC LIMIT 1)) AS thumbnail_id FROM galleries g WHERE ? OR g.owner_id=? OR EXISTS (SELECT 1 FROM gallery_members m WHERE m.gallery_id=g.id AND m.user_id=?) ORDER BY g.rowid DESC', (user['role'] == 'admin', user['id'], user['id'])).fetchall()
+        return [dict(row) for row in rows]
+
+
+@app.post('/api/galleries', status_code=201)
+def create_gallery(payload: GalleryCreate, user=Depends(auth.current_user)):
+    auth.require_permission(user, 'can_create_galleries')
+    if not payload.name.strip():
+        raise HTTPException(400, 'Donnez un nom à la galerie.')
+    gallery_id = uuid.uuid4().hex
+    with connect() as db:
+        db.execute('INSERT INTO galleries(id,name,owner_id) VALUES (?,?,?)', (gallery_id, payload.name.strip(), user['id']))
+    return {'id': gallery_id, 'name': payload.name.strip(), 'owner_id': user['id'], 'archived': 0, 'photo_count': 0}
+
+
+@app.patch('/api/galleries/{gallery_id}')
+def update_gallery(gallery_id: str, payload: GalleryUpdate, user=Depends(auth.current_user)):
+    if payload.name is not None and not payload.name.strip():
+        raise HTTPException(400, 'Donnez un nom à la galerie.')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        gallery_access(db, gallery_id, user, 'can_create_galleries', owner=True)
+        if 'cover_photo_id' in payload.model_fields_set:
+            if payload.cover_photo_id is not None and not db.execute('SELECT 1 FROM photos WHERE id=? AND gallery_id=?', (payload.cover_photo_id, gallery_id)).fetchone():
+                raise HTTPException(400, 'Choisissez une photo de cette galerie.')
+            db.execute('UPDATE galleries SET cover_photo_id=? WHERE id=?', (payload.cover_photo_id, gallery_id))
+        if payload.name is not None:
+            db.execute('UPDATE galleries SET name=? WHERE id=?', (payload.name.strip(), gallery_id))
+        if payload.archived is not None:
+            db.execute('UPDATE galleries SET archived=? WHERE id=?', (payload.archived, gallery_id))
+            if payload.archived:
+                db.execute('UPDATE client_links SET expires=0 WHERE gallery_id=?', (gallery_id,))
+    return {'ok': True}
+
+
+class Member(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+
+
+@app.get('/api/galleries/{gallery_id}/members')
+def gallery_members(gallery_id: str, user=Depends(auth.current_user)):
+    with connect() as db:
+        gallery_access(db, gallery_id, user, owner=True)
+        return [dict(row) for row in db.execute('SELECT u.id,u.username FROM gallery_members m JOIN users u ON u.id=m.user_id WHERE m.gallery_id=?', (gallery_id,))]
+
+
+@app.post('/api/galleries/{gallery_id}/members')
+def add_member(gallery_id: str, payload: Member, user=Depends(auth.current_user)):
+    with connect() as db:
+        gallery_access(db, gallery_id, user, 'can_share', write=True, owner=True)
+        member = db.execute("SELECT id FROM users WHERE username=? AND active=1 AND role='photographer'", (payload.username,)).fetchone()
+        if member is None:
+            raise HTTPException(404, 'Photographe actif introuvable.')
+        db.execute('INSERT OR IGNORE INTO gallery_members VALUES (?,?)', (gallery_id, member['id']))
+    return {'ok': True}
+
+
+@app.delete('/api/galleries/{gallery_id}/members/{member_id}')
+def remove_member(gallery_id: str, member_id: int, user=Depends(auth.current_user)):
+    with connect() as db:
+        gallery_access(db, gallery_id, user, 'can_share', owner=True)
+        db.execute('DELETE FROM gallery_members WHERE gallery_id=? AND user_id=?', (gallery_id, member_id))
+        # Removing a collaborator also revokes links they might have copied.
+        db.execute('UPDATE client_links SET expires=0 WHERE gallery_id=?', (gallery_id,))
+    return {'ok': True}
+
+
+class LinkCreate(BaseModel):
+    gallery_id: str
+    days: int = Field(default=7, ge=1, le=90)
+
+
+@app.get('/api/client-links')
+def list_links(gallery_id: str, user=Depends(auth.current_user)):
+    with connect() as db:
+        gallery_access(db, gallery_id, user, 'can_share')
+        return [dict(row) for row in db.execute('SELECT token_hash AS id, expires FROM client_links WHERE gallery_id=? ORDER BY rowid DESC', (gallery_id,))]
+
+
+@app.delete('/api/client-links/{link_id}')
+def revoke_link(link_id: str, user=Depends(auth.current_user)):
+    with connect() as db:
+        row = db.execute('SELECT gallery_id FROM client_links WHERE token_hash=?', (link_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'Lien introuvable.')
+        gallery_access(db, row['gallery_id'], user, 'can_share')
+        db.execute('UPDATE client_links SET expires=0 WHERE token_hash=?', (link_id,))
+    return {'ok': True}
 
 
 def digest(token):
@@ -158,10 +347,10 @@ def client_session(request: Request):
         raise HTTPException(401, 'Lien client invalide ou expiré.')
     session_hash = digest(token)
     with connect() as db:
-        row = db.execute('SELECT s.token_hash FROM client_sessions s JOIN client_links l ON l.token_hash=s.link_hash WHERE s.token_hash=? AND s.expires>? AND l.expires>?', (session_hash, int(time.time()), int(time.time()))).fetchone()
+        row = db.execute('SELECT s.token_hash, l.gallery_id FROM client_sessions s JOIN client_links l ON l.token_hash=s.link_hash JOIN galleries g ON g.id=l.gallery_id LEFT JOIN users u ON u.id=g.owner_id WHERE s.token_hash=? AND s.expires>? AND l.expires>? AND g.archived=0 AND (g.owner_id IS NULL OR u.active=1)', (session_hash, int(time.time()), int(time.time()))).fetchone()
     if row is None:
         raise HTTPException(401, 'Lien client invalide ou expiré.')
-    return session_hash
+    return dict(row)
 
 
 class ClientToken(BaseModel):
@@ -174,11 +363,17 @@ def client_page():
 
 
 @app.post('/api/client-links')
-def create_client_link(user=Depends(auth.current_user)):
+def create_client_link(payload: LinkCreate, user=Depends(auth.current_user)):
     token = secrets.token_urlsafe(32)
     with connect() as db:
-        db.execute('INSERT INTO client_links VALUES (?, ?)', (digest(token), int(time.time()) + 7 * 86400))
-    return {'token': token, 'expires_in_days': 7}
+        gallery_access(db, payload.gallery_id, user, 'can_share', write=True)
+        db.execute('INSERT INTO client_links(token_hash,expires,gallery_id) VALUES (?,?,?)', (digest(token), int(time.time()) + payload.days * 86400, payload.gallery_id))
+    return {'token': token, 'expires_in_days': payload.days}
+
+
+@app.get('/api/client/session')
+def client_session_status(session=Depends(client_session)):
+    return {'ok': True}
 
 
 @app.post('/api/client/redeem')
@@ -186,12 +381,12 @@ def redeem_client_link(payload: ClientToken, request: Request, response: Respons
     link_hash = digest(payload.token)
     now = int(time.time())
     with connect() as db:
-        row = db.execute('SELECT expires FROM client_links WHERE token_hash=? AND expires>?', (link_hash, now)).fetchone()
+        row = db.execute('SELECT l.expires FROM client_links l JOIN galleries g ON g.id=l.gallery_id LEFT JOIN users u ON u.id=g.owner_id WHERE l.token_hash=? AND l.expires>? AND g.archived=0 AND (g.owner_id IS NULL OR u.active=1)', (link_hash, now)).fetchone()
         if row is None:
             raise HTTPException(401, 'Lien client invalide ou expiré.')
         session = secrets.token_urlsafe(32)
         db.execute('INSERT INTO client_sessions VALUES (?, ?, ?)', (digest(session), link_hash, min(row['expires'], now + 8 * 3600)))
-    response.set_cookie('photofind_client', session, httponly=True, secure=request.url.scheme == 'https', samesite='strict', max_age=8 * 3600, path='/')
+    response.set_cookie('photofind_client', session, httponly=True, secure=os.environ.get('SECURE_COOKIES', '').lower() == 'true' or request.url.scheme == 'https', samesite='strict', max_age=8 * 3600, path='/')
     response.headers['Cache-Control'] = 'no-store'
     return {'ok': True}
 
@@ -199,8 +394,10 @@ def redeem_client_link(payload: ClientToken, request: Request, response: Respons
 @app.post('/api/client-qr')
 def client_qr(payload: ClientToken, request: Request, user=Depends(auth.current_user)):
     with connect() as db:
-        if db.execute('SELECT 1 FROM client_links WHERE token_hash=? AND expires>?', (digest(payload.token), int(time.time()))).fetchone() is None:
+        link = db.execute('SELECT gallery_id FROM client_links WHERE token_hash=? AND expires>?', (digest(payload.token), int(time.time()))).fetchone()
+        if link is None:
             raise HTTPException(404, 'Lien invalide.')
+        gallery_access(db, link['gallery_id'], user, 'can_share', write=True)
     origin = request.headers.get('origin', '')
     from urllib.parse import urlsplit
     parsed = urlsplit(origin)
@@ -213,14 +410,17 @@ def client_qr(payload: ClientToken, request: Request, user=Depends(auth.current_
 
 
 @app.get('/api/photos')
-def list_photos(user=Depends(auth.current_user)):
+def list_photos(gallery_id: str, user=Depends(auth.current_user)):
     with connect() as db:
-        rows = db.execute('SELECT id, name, faces FROM photos ORDER BY rowid DESC').fetchall()
+        gallery_access(db, gallery_id, user)
+        rows = db.execute('SELECT id, name, faces FROM photos WHERE gallery_id=? ORDER BY rowid DESC', (gallery_id,)).fetchall()
     return [{'id': r['id'], 'name': r['name'], 'faces': len(json.loads(r['faces']))} for r in rows]
 
 
 @app.post('/api/photos')
-async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_user)):
+async def upload(gallery_id: str, files: list[UploadFile] = File(...), user=Depends(auth.current_user)):
+    with connect() as db:
+        gallery_access(db, gallery_id, user, 'can_upload', write=True)
     results = []
     for file in files:
         try:
@@ -232,9 +432,16 @@ async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_
             ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ok:
                 raise ValueError('Impossible de lire cette image.')
-            (PHOTOS / (photo_id + '.jpg')).write_bytes(encoded.tobytes())
-            with connect() as db:
-                db.execute('INSERT INTO photos VALUES (?, ?, ?)', (photo_id, Path(file.filename or 'Photo').name, json.dumps(faces)))
+            with lock, connect() as db:
+                gallery_access(db, gallery_id, user, 'can_upload', write=True)
+                path = PHOTOS / (photo_id + '.jpg')
+                path.write_bytes(encoded.tobytes())
+                try:
+                    db.execute('INSERT INTO photos(id,name,faces,gallery_id) VALUES (?,?,?,?)', (photo_id, Path(file.filename or 'Photo').name, json.dumps(faces), gallery_id))
+                    db.commit()
+                except Exception:
+                    path.unlink(missing_ok=True)
+                    raise
             results.append({'name': file.filename, 'faces': len(faces)})
         except (ValueError, HTTPException) as e:
             results.append({'name': file.filename, 'error': str(e.detail if isinstance(e, HTTPException) else e)})
@@ -255,7 +462,7 @@ async def search(file: UploadFile = File(...), session_hash=Depends(client_sessi
         raise HTTPException(400, 'Le selfie doit contenir exactement un visage. Réessayez avec une photo bien éclairée.')
     query = np.array(faces[0])
     with connect() as db:
-        rows = db.execute('SELECT id, name, faces FROM photos').fetchall()
+        rows = db.execute('SELECT id, name, faces FROM photos WHERE gallery_id=?', (session_hash['gallery_id'],)).fetchall()
     matches = []
     for row in rows:
         vectors = json.loads(row['faces'])
@@ -264,8 +471,8 @@ async def search(file: UploadFile = File(...), session_hash=Depends(client_sessi
             if score >= THRESHOLD:
                 matches.append({'id': row['id'], 'name': row['name'], 'score': round(score, 3)})
     with connect() as db:
-        db.execute('DELETE FROM client_matches WHERE session_hash=?', (session_hash,))
-        db.executemany('INSERT INTO client_matches VALUES (?, ?)', [(session_hash, item['id']) for item in matches])
+        db.execute('DELETE FROM client_matches WHERE session_hash=?', (session_hash['token_hash'],))
+        db.executemany('INSERT INTO client_matches VALUES (?, ?)', [(session_hash['token_hash'], item['id']) for item in matches])
     return sorted(matches, key=lambda x: x['score'], reverse=True)
 
 
@@ -273,16 +480,21 @@ async def search(file: UploadFile = File(...), session_hash=Depends(client_sessi
 def photo_image(photo_id: str, user=Depends(auth.current_user)):
     if len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
         raise HTTPException(404)
+    with connect() as db:
+        row = db.execute('SELECT gallery_id FROM photos WHERE id=?', (photo_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404)
+        gallery_access(db, row['gallery_id'], user)
     path = PHOTOS / (photo_id + '.jpg')
     if not path.is_file():
         raise HTTPException(404)
-    return FileResponse(path, media_type='image/jpeg', filename='photo.jpg', content_disposition_type='inline')
+    return FileResponse(path, media_type='image/jpeg', filename='photo.jpg', content_disposition_type='inline', headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/client/photos/{photo_id}/image')
 def client_photo_image(photo_id: str, session_hash=Depends(client_session)):
     with connect() as db:
-        allowed = db.execute('SELECT 1 FROM client_matches WHERE session_hash=? AND photo_id=?', (session_hash, photo_id)).fetchone()
+        allowed = db.execute('SELECT 1 FROM client_matches WHERE session_hash=? AND photo_id=?', (session_hash['token_hash'], photo_id)).fetchone()
     if allowed is None or len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
         raise HTTPException(404)
     path = PHOTOS / (photo_id + '.jpg')
@@ -296,19 +508,25 @@ def delete_photo(photo_id: str, user=Depends(auth.current_user)):
     if len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
         raise HTTPException(404, 'Photo introuvable.')
     with lock, connect() as db:
-        row = db.execute('SELECT id FROM photos WHERE id = ?', (photo_id,)).fetchone()
+        row = db.execute('SELECT gallery_id FROM photos WHERE id = ?', (photo_id,)).fetchone()
         if row is None:
             raise HTTPException(404, 'Photo introuvable.')
-        (PHOTOS / (photo_id + '.jpg')).unlink(missing_ok=True)
+        gallery_access(db, row['gallery_id'], user, 'can_delete', write=True)
         db.execute('DELETE FROM photos WHERE id = ?', (photo_id,))
+        db.execute('DELETE FROM client_matches WHERE photo_id=?', (photo_id,))
+        db.commit()
+        (PHOTOS / (photo_id + '.jpg')).unlink(missing_ok=True)
     return {'deleted': True}
 
 
 @app.delete('/api/photos')
-def clear_photos(user=Depends(auth.current_user)):
+def clear_photos(gallery_id: str, user=Depends(auth.current_user)):
     with lock, connect() as db:
-        ids = [row['id'] for row in db.execute('SELECT id FROM photos')]
-        db.execute('DELETE FROM photos')
+        gallery_access(db, gallery_id, user, 'can_delete', write=True)
+        ids = [row['id'] for row in db.execute('SELECT id FROM photos WHERE gallery_id=?', (gallery_id,))]
+        db.executemany('DELETE FROM client_matches WHERE photo_id=?', [(photo_id,) for photo_id in ids])
+        db.execute('DELETE FROM photos WHERE gallery_id=?', (gallery_id,))
+        db.commit()
         for photo_id in ids:
             (PHOTOS / (photo_id + '.jpg')).unlink(missing_ok=True)
     return {'deleted': len(ids)}

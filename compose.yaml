@@ -3,6 +3,8 @@ services:
     build: .
     pull_policy: build
     restart: unless-stopped
+    environment:
+      SECURE_COOKIES: "true"
     ports:
       - "127.0.0.1:18080:8000"
     volumes:

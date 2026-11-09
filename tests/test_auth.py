@@ -52,7 +52,8 @@ class AccountTests(unittest.TestCase):
                 photographer = call('/api/login', 'POST', {'username':'user','password':'long password 123'})
                 user_cookie = photographer.headers['Set-Cookie'].split(';')[0]
                 self.assertEqual(call('/api/users', 'POST', {'username':'other','password':'long password 123'}, user_cookie).status, 403)
-                self.assertEqual(call('/api/photos', cookie=user_cookie).status, 200)
+                gallery = json.load(call('/api/galleries', 'POST', {'name':'Test'}, user_cookie))
+                self.assertEqual(call('/api/photos?gallery_id=' + gallery['id'], cookie=user_cookie).status, 200)
                 self.assertEqual(call('/api/logout', 'POST', cookie=admin_cookie).status, 200)
                 self.assertEqual(call('/api/me', cookie=admin_cookie).status, 401)
             finally:

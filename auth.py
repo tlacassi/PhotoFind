@@ -21,6 +21,11 @@ def connect(path: Path):
 def initialize(path: Path):
     with connect(path) as db:
         db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL COLLATE NOCASE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN (\'admin\', \'photographer\')))')
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(users)')}
+        for name in ('active', 'can_create_galleries', 'can_upload', 'can_delete', 'can_share'):
+            if name not in columns:
+                db.execute(f'ALTER TABLE users ADD COLUMN {name} INTEGER NOT NULL DEFAULT 1')
+        db.execute('CREATE TABLE IF NOT EXISTS login_attempts (username TEXT PRIMARY KEY COLLATE NOCASE, failures INTEGER NOT NULL, until INTEGER NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL)')
 
 
@@ -56,7 +61,7 @@ def create_user(path: Path, username: str, password: str, role: str, initial=Fal
 def authenticate(path: Path, username: str, password: str):
     with connect(path) as db:
         row = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-    if row and verify_password(password, row['password_hash']):
+    if row and row['active'] and verify_password(password, row['password_hash']):
         return row
     return None
 
@@ -76,7 +81,7 @@ def current_user(request: Request):
         raise HTTPException(401, 'Connexion requise.')
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     with connect(request.app.state.db_path) as db:
-        row = db.execute('SELECT users.id, users.username, users.role FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires>?', (token_hash, int(time.time()))).fetchone()
+        row = db.execute('SELECT users.* FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires>? AND users.active=1', (token_hash, int(time.time()))).fetchone()
     if row is None:
         raise HTTPException(401, 'Connexion requise.')
     return row
@@ -87,3 +92,28 @@ def admin_user(request: Request):
     if user['role'] != 'admin':
         raise HTTPException(403, 'Réservé à l’administrateur.')
     return user
+
+
+def public_user(user):
+    return {key: user[key] for key in ('id', 'username', 'role', 'active', 'can_create_galleries', 'can_upload', 'can_delete', 'can_share')}
+
+
+def require_permission(user, permission):
+    if user['role'] != 'admin' and not user[permission]:
+        raise HTTPException(403, 'Permission insuffisante.')
+
+
+def login_allowed(path, username):
+    now = int(time.time())
+    with connect(path) as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DELETE FROM login_attempts WHERE until<=?', (now,))
+        row = db.execute('SELECT failures FROM login_attempts WHERE username=?', (username,)).fetchone()
+        if row and row['failures'] >= 10:
+            raise HTTPException(429, 'Trop de tentatives. Réessayez dans 15 minutes.')
+        db.execute('INSERT INTO login_attempts VALUES (?,1,?) ON CONFLICT(username) DO UPDATE SET failures=failures+1', (username, now + 900))
+
+
+def clear_attempts(path, username):
+    with connect(path) as db:
+        db.execute('DELETE FROM login_attempts WHERE username=?', (username,))

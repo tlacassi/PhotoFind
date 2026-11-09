@@ -5,7 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY download_models.py .
 RUN python download_models.py && useradd --system --uid 10001 --create-home photofind && mkdir -p /data && chown photofind:photofind /data
-COPY app.py auth.py create_admin.py ./
+COPY app.py auth.py storage.py create_admin.py maintenance.py ./
 COPY static static
 USER photofind
 EXPOSE 8000
