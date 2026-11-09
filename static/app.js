@@ -31,3 +31,16 @@ $('#copy-link')?.addEventListener('click', async () => {
     $('#copy-status').textContent = 'Sélectionnez et copiez le lien ci-dessus.';
   }
 });
+
+if ($('#logout')) {
+  api('/api/me').then(user => { $('#admin-section').hidden = user.role !== 'admin'; }).catch(() => location.assign('/login'));
+  $('#logout').addEventListener('click', async () => { await api('/api/logout', {method:'POST'}); location.assign('/login'); });
+  $('#create-user').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget, data = new FormData(form), status = $('#user-status');
+    try {
+      await api('/api/users', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:data.get('username'), password:data.get('password')})});
+      status.textContent = 'Compte photographe créé.'; form.reset();
+    } catch(error) { status.textContent = error.message; }
+  });
+}

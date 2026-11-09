@@ -4,14 +4,18 @@ import os
 import sqlite3
 import threading
 import uuid
+import secrets
+
+import auth
 from pathlib import Path
 
 import cv2
 import numpy as np
 import qrcode
 from PIL import Image, ImageOps, UnidentifiedImageError
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, RedirectResponse
+from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +28,8 @@ THRESHOLD = float(os.environ.get('MATCH_THRESHOLD', '0.363'))
 MAX_BYTES = 20 * 1024 * 1024
 lock = threading.Lock()
 app = FastAPI(title='PhotoFind')
+app.state.db_path = DB
+auth.initialize(DB)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 
 
@@ -80,18 +86,69 @@ async def image_bytes(file):
     return contents
 
 
+class Credentials(BaseModel):
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=256)
+
+
 @app.get('/')
-def index():
+def index(request: Request):
+    try:
+        auth.current_user(request)
+    except HTTPException:
+        return RedirectResponse('/login', status_code=303)
     return FileResponse(ROOT / 'static' / 'index.html')
 
 
+@app.get('/login')
+def login_page():
+    return FileResponse(ROOT / 'static' / 'login.html')
+
+
+@app.post('/api/login')
+def login(credentials: Credentials, request: Request, response: Response):
+    user = auth.authenticate(DB, credentials.username, credentials.password)
+    if not user:
+        raise HTTPException(401, 'Identifiant ou mot de passe incorrect.')
+    token = auth.new_session(DB, user['id'])
+    response.set_cookie(auth.COOKIE, token, httponly=True, samesite='strict', secure=request.url.scheme == 'https', max_age=auth.SESSION_SECONDS, path='/')
+    return {'username': user['username'], 'role': user['role']}
+
+
+@app.post('/api/logout')
+def logout(request: Request, response: Response, user=Depends(auth.current_user)):
+    token = request.cookies.get(auth.COOKIE, '')
+    import hashlib
+    with auth.connect(DB) as db:
+        db.execute('DELETE FROM sessions WHERE token_hash=?', (hashlib.sha256(token.encode()).hexdigest(),))
+    response.delete_cookie(auth.COOKIE, path='/')
+    return {'ok': True}
+
+
+@app.get('/api/me')
+def me(user=Depends(auth.current_user)):
+    return {'username': user['username'], 'role': user['role']}
+
+
+@app.post('/api/users', status_code=201)
+def create_photographer(credentials: Credentials, user=Depends(auth.admin_user)):
+    try:
+        auth.create_user(DB, credentials.username, credentials.password, 'photographer')
+    except ValueError as error:
+        raise HTTPException(400, str(error))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, 'Cet identifiant existe déjà.')
+    return {'username': credentials.username, 'role': 'photographer'}
+
+
+
 @app.get('/client', name='client_page')
-def client_page():
+def client_page(user=Depends(auth.current_user)):
     return FileResponse(ROOT / 'static' / 'client.html')
 
 
 @app.get('/api/client-qr')
-def client_qr(request: Request):
+def client_qr(request: Request, user=Depends(auth.current_user)):
     image = qrcode.make(str(request.url_for('client_page')))
     buffer = io.BytesIO()
     image.save(buffer, format='PNG')
@@ -99,14 +156,14 @@ def client_qr(request: Request):
 
 
 @app.get('/api/photos')
-def list_photos():
+def list_photos(user=Depends(auth.current_user)):
     with connect() as db:
         rows = db.execute('SELECT id, name, faces FROM photos ORDER BY rowid DESC').fetchall()
     return [{'id': r['id'], 'name': r['name'], 'faces': len(json.loads(r['faces']))} for r in rows]
 
 
 @app.post('/api/photos')
-async def upload(files: list[UploadFile] = File(...)):
+async def upload(files: list[UploadFile] = File(...), user=Depends(auth.current_user)):
     results = []
     for file in files:
         try:
@@ -130,7 +187,7 @@ async def upload(files: list[UploadFile] = File(...)):
 
 
 @app.post('/api/search')
-async def search(file: UploadFile = File(...)):
+async def search(file: UploadFile = File(...), user=Depends(auth.current_user)):
     try:
         faces = embeddings(await image_bytes(file))
     except ValueError as e:
@@ -153,7 +210,7 @@ async def search(file: UploadFile = File(...)):
 
 
 @app.get('/api/photos/{photo_id}/image')
-def photo_image(photo_id: str):
+def photo_image(photo_id: str, user=Depends(auth.current_user)):
     if len(photo_id) != 32 or any(c not in '0123456789abcdef' for c in photo_id):
         raise HTTPException(404)
     path = PHOTOS / (photo_id + '.jpg')
@@ -163,7 +220,7 @@ def photo_image(photo_id: str):
 
 
 @app.delete('/api/photos')
-def clear_photos():
+def clear_photos(user=Depends(auth.current_user)):
     with lock, connect() as db:
         ids = [row['id'] for row in db.execute('SELECT id FROM photos')]
         db.execute('DELETE FROM photos')
