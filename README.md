@@ -26,6 +26,14 @@ pas envoyées à un service de reconnaissance externe.
   la transaction d’écriture pour couvrir les imports simultanés. Une erreur par
   fichier est affichée dans le panneau ; les anciennes photos ne sont pas supprimées.
   Il ne s’agit pas d’une recherche approximative de photos ressemblantes.
+- **Détection de visages** : YuNet est utilisé à la résolution native, puis sur des
+  versions réduites à 640 et 320 pixels lorsque l’image est plus grande. Les cadres
+  et points du visage sont ramenés aux coordonnées natives avant SFace. Les visages
+  déjà détectés à la taille native sont conservés ; les doublons entre tailles sont
+  supprimés par recouvrement. Cela aide notamment les gros plans de selfies, sans
+  modifier le seuil de correspondance. Les erreurs distinguent zéro visage,
+  plusieurs visages et un visage détecté sans photo correspondante.
+  Les empreintes des photos déjà importées ne sont pas recalculées automatiquement.
 - **Miniatures et visionneuse** : un worker génère les aperçus de 480 pixels maximum
   dans `.thumbnails/` au sein de la galerie. En attendant, la grille utilise le JPEG
   principal ; elle passe ensuite à l’aperçu. Les aperçus existants ne sont pas

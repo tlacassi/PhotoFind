@@ -143,3 +143,14 @@ n'est pas considérée comme déployée.
 - [x] Afficher l’erreur de doublon dans le traitement en arrière-plan.
 - Validation : 34 tests passent, dont aperçu sans sauvegarde, stabilité des miniatures,
   contenu identique avec métadonnées différentes, concurrence et remontée de l’erreur.
+
+### Selfies et gros plans
+- [x] Distinguer aucun visage, plusieurs visages et aucune correspondance.
+- [x] Détection multi-échelle bornée, avec coordonnées natives pour l’alignement SFace.
+- [x] Conserver les détections natives et supprimer les doublons entre échelles.
+- [x] Garder le seuil de comparaison existant.
+- Validation : 38 tests passent. Sur un gros plan d’une image publique de test OpenCV,
+  l’ancien passage natif détectait 0 visage ; la correction en détecte 1 et retrouve
+  la référence (cosinus 0,943 au seuil 0,363). Ce n’est pas une mesure de précision
+  sur les photos de l’utilisateur ; son selfie reste à retester.
+- [ ] Si nécessaire, proposer une réanalyse des visages des galeries existantes.

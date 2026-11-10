@@ -78,18 +78,48 @@ def read_image(contents):
         raise ValueError('Format non pris en charge. Utilisez une image JPEG, PNG ou WebP.')
 
 
+def detect_faces(image, detector):
+    """Keep native detections and add large faces from smaller working images."""
+    height, width = image.shape[:2]
+    sizes = [max(width,height)] + [side for side in (640,320) if side < max(width,height)]
+    kept = []
+    for side in sizes:
+        scale = side / max(width,height)
+        resized = image if scale == 1 else cv2.resize(image,(max(1,round(width*scale)),max(1,round(height*scale))),interpolation=cv2.INTER_AREA)
+        detector.setInputSize((resized.shape[1],resized.shape[0]))
+        _, faces = detector.detect(resized)
+        if faces is None:
+            continue
+        for face in faces:
+            restored = face.copy()
+            sx, sy = width/resized.shape[1], height/resized.shape[0]
+            restored[:4] *= np.array([sx,sy,sx,sy],dtype=np.float32)
+            restored[4:14] = (restored[4:14].reshape(5,2) * np.array([sx,sy],dtype=np.float32)).reshape(10)
+            duplicate = False
+            for previous in kept:
+                left=max(restored[0],previous[0]); top=max(restored[1],previous[1])
+                right=min(restored[0]+restored[2],previous[0]+previous[2]); bottom=min(restored[1]+restored[3],previous[1]+previous[3])
+                intersection=max(0,float(right-left))*max(0,float(bottom-top))
+                union=float(restored[2]*restored[3]+previous[2]*previous[3])-intersection
+                if union>0 and intersection/union>.3:
+                    duplicate=True;break
+            if not duplicate:
+                kept.append(restored)
+    return kept
+
+
 def embeddings(contents):
     image = read_image(contents)
     detector_path = MODELS / 'face_detection_yunet_2023mar.onnx'
     recognizer_path = MODELS / 'face_recognition_sface_2021dec.onnx'
     if not detector_path.is_file() or not recognizer_path.is_file():
         raise RuntimeError('Modèles absents. Lancez d’abord : python download_models.py')
-    # OpenCV objects have mutable internal state; each request gets its own instances.
+    # Each request owns mutable OpenCV objects; alignment uses native image coordinates.
     detector = cv2.FaceDetectorYN.create(str(detector_path), '', (image.shape[1], image.shape[0]), 0.9, 0.3, 5000)
-    recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), '')
-    _, faces = detector.detect(image)
-    if faces is None:
+    faces = detect_faces(image,detector)
+    if not faces:
         return []
+    recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), '')
     result = []
     for face in faces:
         aligned = recognizer.alignCrop(image, face)
@@ -838,8 +868,10 @@ async def search(file: UploadFile = File(...), session_hash=Depends(client_sessi
         raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
-    if len(faces) != 1:
-        raise HTTPException(400, 'Le selfie doit contenir exactement un visage. Réessayez avec une photo bien éclairée.')
+    if not faces:
+        raise HTTPException(400, 'Aucun visage détecté dans ce selfie. Placez-vous de face, avec le visage entier et un éclairage suffisant.')
+    if len(faces) > 1:
+        raise HTTPException(400, f'{len(faces)} visages détectés dans ce selfie. Choisissez une photo où vous êtes seul.')
     query = np.array(faces[0])
     with connect() as db:
         rows = db.execute('SELECT id, name, faces, thumbnail_status FROM photos WHERE gallery_id=?', (session_hash['gallery_id'],)).fetchall()

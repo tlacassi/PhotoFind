@@ -151,6 +151,18 @@ class GalleryTests(unittest.TestCase):
             self.assertIn('SameSite=strict', response.headers['set-cookie'])
 
 
+    def test_selfie_feedback_separates_detection_from_no_match(self):
+        client,_=self.client_for(self.alice,self.a)
+        for faces,message in [([], 'Aucun visage détecté'), ([[1.,0.],[1.,0.]], '2 visages détectés')]:
+            with patch.object(app,'analyze_selfie',return_value=faces):
+                response=client.post('/api/search',files={'file':('selfie.png',self.image)})
+                self.assertEqual(response.status_code,400)
+                self.assertIn(message,response.json()['detail'])
+        with patch.object(app,'analyze_selfie',return_value=[[1.,0.]]):
+            response=client.post('/api/search',files={'file':('selfie.png',self.image)})
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json(),[])
+
     def test_multiple_links_modes_and_gallery_path(self):
         photo = self.upload(self.alice, self.a)
         foreign = self.upload(self.bob, self.b)

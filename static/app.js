@@ -457,8 +457,8 @@ if (selfieInput) {
     $('#search-status').textContent = 'Recherche en cours…'; $('#results-section').hidden = true;
     try {
       const results = await api(`/api/search?gallery_id=${encodeURIComponent(clientGalleryId)}`, {method:'POST', body:data});
-      $('#search-status').textContent = results.length ? 'Recherche terminée.' : 'Aucune photo correspondante. Essayez un selfie bien éclairé.';
-      $('#results').replaceChildren(...results.map(photo => card(photo, true, results))); $('#result-count').textContent = results.length ? `Hey, ${results.length} photo${results.length > 1 ? 's trouvées' : ' trouvée'} !` : 'Aucune photo trouvée pour ce selfie.'; $('#results-section').hidden = false;
+      $('#search-status').textContent = results.length ? 'Recherche terminée.' : 'Votre visage a bien été détecté, mais aucune photo correspondante n’a été trouvée dans cette galerie. Essayez un autre selfie de face si vous savez que vous y apparaissez.';
+      $('#results').replaceChildren(...results.map(photo => card(photo, true, results))); $('#result-count').textContent = results.length ? `Hey, ${results.length} photo${results.length > 1 ? 's trouvées' : ' trouvée'} !` : 'Visage détecté, mais aucune photo correspondante.'; $('#results-section').hidden = false;
       $('#result-count').focus({preventScroll:true}); $('#results-section').scrollIntoView({behavior:'smooth', block:'start'});
     } catch (error) { $('#search-status').textContent = error.message; }
     finally { selfieInput.disabled = false; selfieInput.value = ''; }
