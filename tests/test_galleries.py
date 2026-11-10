@@ -357,6 +357,60 @@ class GalleryTests(unittest.TestCase):
         self.assertIn('doublon',duplicate.json()[0]['error'])
         self.assertFalse(app.generate_next_thumbnail())
 
+    def test_completed_face_jobs_are_not_restarted_without_manual_request(self):
+        import time,jobs
+        self.upload(self.alice,self.a)
+        self.alice.post('/api/galleries/'+self.a+'/reindex')
+        runner=jobs.ProcessingQueue(app.DB,app.finish_photo_job,app.cleanup_photo_job,lambda:False,1)
+        runner.start()
+        try:
+            for _ in range(100):
+                remaining=self.alice.get('/api/photo-jobs',params={'gallery_id':self.a}).json()['remaining']
+                if not remaining:break
+                time.sleep(.02)
+            else:self.fail('Reanalysis did not finish')
+        finally:runner.stop()
+        with patch.object(app,'embeddings') as analyzer:
+            restarted=jobs.ProcessingQueue(app.DB,app.finish_photo_job,app.cleanup_photo_job,lambda:False,1)
+            restarted.start();restarted.stop()
+            analyzer.assert_not_called()
+        state=self.alice.get('/api/photo-jobs',params={'gallery_id':self.a}).json()
+        self.assertEqual(state['remaining'],0)
+        self.assertTrue(all(job['status']=='done' for job in state['jobs']))
+        self.assertEqual(self.alice.post('/api/galleries/'+self.a+'/reindex').json()['queued'],1)
+
+    def test_reanalysis_is_deduplicated_preserves_files_and_keeps_old_faces(self):
+        import hashlib,time,jobs
+        photo=self.upload(self.alice,self.a)
+        with app.connect() as db:
+            path=storage.gallery_directory(db,app.PHOTOS,self.a)/(photo+'.jpg')
+            before=hashlib.sha256(path.read_bytes()).hexdigest()
+            db.execute("UPDATE photos SET faces='[]' WHERE id=?",(photo,))
+        self.assertEqual(self.bob.post('/api/galleries/'+self.a+'/reindex').status_code,404)
+        first=self.alice.post('/api/galleries/'+self.a+'/reindex')
+        self.assertEqual(first.status_code,202)
+        self.assertEqual(first.json()['queued'],1)
+        self.assertEqual(self.alice.post('/api/galleries/'+self.a+'/reindex').json()['queued'],0)
+        def run(features):
+            with patch.object(app,'embeddings',return_value=features):
+                runner=jobs.ProcessingQueue(app.DB,app.finish_photo_job,app.cleanup_photo_job,lambda:False,1)
+                runner.start()
+                try:
+                    for _ in range(100):
+                        state=self.alice.get('/api/photo-jobs',params={'gallery_id':self.a}).json()
+                        if state['remaining']==0: break
+                        time.sleep(.02)
+                    else: self.fail('Reanalysis did not finish')
+                finally: runner.stop()
+                self.assertTrue(all(job['status']=='done' for job in state['jobs']))
+        run([[1.,0.],[0.,1.]])
+        self.assertEqual(self.alice.get('/api/photos',params={'gallery_id':self.a}).json()[0]['faces'],2)
+        self.alice.post('/api/galleries/'+self.a+'/reindex')
+        run([])
+        self.assertEqual(self.alice.get('/api/photos',params={'gallery_id':self.a}).json()[0]['faces'],2)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),before)
+        self.assertTrue(path.is_file())
+
     def test_named_links_can_be_copied_and_deleted_from_list(self):
         created = self.alice.post('/api/client-links',json={'gallery_id':self.a,'name':'Client Dupont','mode':'both'}).json()
         response = self.alice.get('/api/client-links',params={'gallery_id':self.a})

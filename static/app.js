@@ -143,6 +143,8 @@ async function selectGallery(id) {
   $('#rename-gallery').hidden = $('#archive-gallery').hidden = !owner || !allowed('can_create_galleries');
   $('#gallery-branding').hidden = !owner || !allowed('can_create_galleries');
   $('#branding-accent').value = palette.accent_color || '#789a78'; $('#branding-background').value = palette.background_color || '#f8f7f1';
+  $('#reindex-gallery').hidden = !owner || !allowed('can_upload');
+  $('#reindex-gallery').disabled = Boolean(selectedGallery.archived);
   $('#delete-gallery').hidden = !owner || !allowed('can_delete');
   $('#archive-gallery').textContent = selectedGallery.archived ? 'Activer la galerie' : 'Désactiver la galerie';
   photoInput.disabled = Boolean(selectedGallery.archived) || !allowed('can_upload');
@@ -210,7 +212,7 @@ function uploadOne(file, galleryId, update) {
   });
 }
 function uploadControls(disabled) {
-  for (const selector of ['#photos','#open-create-gallery','#clear','#rename-gallery','#archive-gallery','#delete-gallery']) $(selector).disabled = disabled;
+  for (const selector of ['#photos','#open-create-gallery','#clear','#rename-gallery','#archive-gallery','#delete-gallery','#reindex-gallery']) $(selector).disabled = disabled;
   for (const button of document.querySelectorAll('#library button')) button.disabled = disabled;
   renderGalleries();
 }
@@ -361,6 +363,15 @@ if (photoInput) {
   $('#retry-upload').addEventListener('click', () => uploadBatch([...failedUploads]));
   $('#open-create-gallery').addEventListener('click', () => { $('#create-gallery-status').textContent = ''; $('#create-gallery-dialog').showModal(); });
   $('#cancel-create-gallery').addEventListener('click', () => $('#create-gallery-dialog').close());
+  $('#reindex-gallery').addEventListener('click', async () => {
+    if (!selectedGallery || uploading) return;
+    const button = $('#reindex-gallery'); button.disabled = true;
+    try {
+      const result = await api(`/api/galleries/${selectedGallery.id}/reindex`,{method:'POST'});
+      $('#gallery-status').textContent = `${result.queued} photo(s) en réanalyse. Les fichiers restent inchangés ; les anciennes empreintes sont conservées si aucun visage supplémentaire n’est trouvé.`;
+      toastDismissed = false; await pollGalleryProcessing();
+    } catch(error) { message(error); } finally { button.disabled = Boolean(selectedGallery?.archived); }
+  });
   $('#delete-gallery').addEventListener('click', () => {
     if (uploading || !selectedGallery) return;
     $('#delete-gallery-description').textContent = `Galerie : ${selectedGallery.name}`;

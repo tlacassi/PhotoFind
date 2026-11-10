@@ -46,6 +46,8 @@ def initialize(path: Path):
         db.execute('CREATE INDEX IF NOT EXISTS photos_encoded ON photos(gallery_id,encoded_hash)')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS photos_job ON photos(job_id)')
         db.execute("CREATE TABLE IF NOT EXISTS photo_jobs (id TEXT PRIMARY KEY, gallery_id TEXT NOT NULL REFERENCES galleries(id), user_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, input_path TEXT NOT NULL, input_bytes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued', error TEXT, faces INTEGER, photo_id TEXT, created INTEGER NOT NULL)")
+        if 'kind' not in {row['name'] for row in db.execute('PRAGMA table_info(photo_jobs)')}:
+            db.execute("ALTER TABLE photo_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'upload'")
         db.execute('CREATE INDEX IF NOT EXISTS photo_jobs_gallery ON photo_jobs(gallery_id,status)')
         if 'mode' not in {row['name'] for row in db.execute('PRAGMA table_info(client_links)')}:
             db.execute("ALTER TABLE client_links ADD COLUMN mode TEXT NOT NULL DEFAULT 'search'")

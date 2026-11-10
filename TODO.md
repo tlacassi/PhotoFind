@@ -153,4 +153,22 @@ n'est pas considérée comme déployée.
   l’ancien passage natif détectait 0 visage ; la correction en détecte 1 et retrouve
   la référence (cosinus 0,943 au seuil 0,363). Ce n’est pas une mesure de précision
   sur les photos de l’utilisateur ; son selfie reste à retester.
-- [ ] Si nécessaire, proposer une réanalyse des visages des galeries existantes.
+- [x] Proposer une réanalyse des visages des galeries existantes.
+
+### Réanalyse des galeries existantes
+- [x] Traitement persistant distinct pour réindexer les visages sans réimporter les images.
+- [x] Bouton propriétaire/administrateur ; refus des galeries non autorisées et désactivées.
+- [x] Ne pas effacer le fichier source dans le nettoyage des traitements de réanalyse.
+- [x] Conserver les anciennes empreintes si le nombre de visages n’augmente pas.
+- [x] Éviter de lancer deux réanalyses simultanées pour la même photo.
+- Validation : 39 tests passent, dont conservation des fichiers et des empreintes
+  lors d’une réanalyse moins favorable.
+- Comparaison locale sans modification des images : 13 photos auparavant sans visage
+  deviennent indexables, 15 visages supplémentaires sur 95 photos. Ce gain ne mesure
+  pas le nombre de correspondances exactes pour le selfie de l’utilisateur.
+
+- Réanalyse locale terminée : 73 photos avec visage indexé (60 auparavant), 84
+  visages (69 auparavant), 0 traitement en erreur. Aucune image n’a été modifiée.
+- [x] Vérifier qu’un redémarrage de la file ne relance pas les analyses terminées.
+- Le bouton manuel permet une nouvelle réanalyse ; les tâches interrompues restent
+  les seules à reprendre automatiquement après un redémarrage.

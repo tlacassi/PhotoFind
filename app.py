@@ -738,6 +738,8 @@ def incoming_path(job):
 
 
 def finish_photo_job(job):
+    if job['kind'] == 'reindex':
+        return finish_reanalysis(job)
     with connect() as db:
         existing = db.execute('SELECT id,faces FROM photos WHERE job_id=?',(job['id'],)).fetchone()
         if existing:
@@ -747,7 +749,45 @@ def finish_photo_job(job):
 
 
 def cleanup_photo_job(job):
+    if job['kind'] == 'reindex':
+        return
     incoming_path(job).unlink(missing_ok=True)
+
+
+def finish_reanalysis(job):
+    with connect() as db:
+        user = db.execute('SELECT * FROM users WHERE id=?',(job['user_id'],)).fetchone()
+        gallery_access(db,job['gallery_id'],user,'can_upload',write=True,owner=True)
+        photo = db.execute('SELECT id FROM photos WHERE id=? AND gallery_id=?',(job['photo_id'],job['gallery_id'])).fetchone()
+        if photo is None: raise HTTPException(404,'Photo supprimée avant la réanalyse.')
+        path = storage.gallery_directory(db,PHOTOS,job['gallery_id']) / (photo['id']+'.jpg')
+    with analysis_slots:
+        features = embeddings(path.read_bytes())
+    with lock, connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        gallery_access(db,job['gallery_id'],user,'can_upload',write=True,owner=True)
+        state = db.execute('SELECT status FROM photo_jobs WHERE id=?',(job['id'],)).fetchone()
+        photo = db.execute('SELECT faces FROM photos WHERE id=? AND gallery_id=?',(job['photo_id'],job['gallery_id'])).fetchone()
+        if state is None or state['status'] != 'processing' or photo is None:
+            raise HTTPException(409,'Réanalyse annulée.')
+        previous = json.loads(photo['faces'])
+        if len(features)>len(previous):
+            db.execute('UPDATE photos SET faces=? WHERE id=?',(json.dumps(features),job['photo_id']))
+        return {'photo_id':job['photo_id'],'faces':max(len(features),len(previous))}
+
+
+@app.post('/api/galleries/{gallery_id}/reindex',status_code=202)
+def enqueue_reanalysis(gallery_id: str, user=Depends(auth.current_user)):
+    count = 0
+    with lock, connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        gallery_access(db,gallery_id,user,'can_upload',write=True,owner=True)
+        photos = db.execute('SELECT id,name FROM photos WHERE gallery_id=?',(gallery_id,)).fetchall()
+        for photo in photos:
+            if db.execute("SELECT 1 FROM photo_jobs WHERE photo_id=? AND kind='reindex' AND status IN ('queued','processing')",(photo['id'],)).fetchone(): continue
+            db.execute("INSERT INTO photo_jobs(id,gallery_id,user_id,name,input_path,input_bytes,status,photo_id,created,kind) VALUES (?,?,?,?,?,0,'queued',?,?,'reindex')",(uuid.uuid4().hex,gallery_id,user['id'],photo['name'],'',photo['id'],int(time.time())))
+            count += 1
+    return {'queued':count}
 
 
 def enqueue_photo(contents, filename, gallery_id, user):
@@ -960,7 +1000,7 @@ def clear_photos(gallery_id: str, user=Depends(auth.current_user)):
     with lock, connect() as db:
         db.execute('BEGIN IMMEDIATE')
         gallery_access(db, gallery_id, user, 'can_delete', write=True)
-        queued = db.execute('SELECT input_path FROM photo_jobs WHERE gallery_id=?',(gallery_id,)).fetchall()
+        queued = db.execute('SELECT input_path,kind FROM photo_jobs WHERE gallery_id=?',(gallery_id,)).fetchall()
         db.execute('DELETE FROM photo_jobs WHERE gallery_id=?',(gallery_id,))
         ids = [row['id'] for row in db.execute('SELECT id FROM photos WHERE gallery_id=?', (gallery_id,))]
         db.executemany('DELETE FROM client_matches WHERE photo_id=?', [(photo_id,) for photo_id in ids])

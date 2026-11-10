@@ -33,7 +33,12 @@ pas envoyées à un service de reconnaissance externe.
   supprimés par recouvrement. Cela aide notamment les gros plans de selfies, sans
   modifier le seuil de correspondance. Les erreurs distinguent zéro visage,
   plusieurs visages et un visage détecté sans photo correspondante.
-  Les empreintes des photos déjà importées ne sont pas recalculées automatiquement.
+  Le bouton « Réanalyser les visages » du propriétaire ou administrateur remet les
+  photos existantes dans la file de traitement. Aucune image n’est modifiée ou
+  supprimée ; les empreintes ne sont remplacées que si la nouvelle analyse détecte
+  davantage de visages. Les photos restent consultables pendant cette opération.
+  Un redémarrage ne relance pas les analyses terminées : leurs résultats et états
+  sont persistés. Seuls les travaux en attente ou interrompus sont repris.
 - **Miniatures et visionneuse** : un worker génère les aperçus de 480 pixels maximum
   dans `.thumbnails/` au sein de la galerie. En attendant, la grille utilise le JPEG
   principal ; elle passe ensuite à l’aperçu. Les aperçus existants ne sont pas
