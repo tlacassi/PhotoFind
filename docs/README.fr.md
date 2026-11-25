@@ -226,5 +226,5 @@ et un DOM simulé : une validation visuelle dans un navigateur reste nécessaire
   galerie, l’interface et les journaux signalent le dossier `.deleted-*` à nettoyer ;
   ce reliquat n’est plus accessible par les liens et n’est plus compté dans le quota.
 
-Voir [TODO.md](TODO.md) pour l'avancement et les validations restantes.
+Voir [TODO.md](../TODO.md) pour l'avancement et les validations restantes.
 Les modèles et leurs licences sont référencés dans [OpenCV Zoo](https://github.com/opencv/opencv_zoo).
